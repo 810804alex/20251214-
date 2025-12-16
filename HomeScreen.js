@@ -15,8 +15,10 @@ import {
   StatusBar,
   TouchableOpacity,
   Dimensions,
+  ActivityIndicator
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
+import * as Location from 'expo-location'; // 🔥 1. 引入 Location
 
 // 子頁面 (保持不變)
 import NotificationScreen from './NotificationScreen';
@@ -25,11 +27,8 @@ import MapScreen from './MapScreen';
 
 // Design System
 import { useTheme } from '../theme';
-import SectionHeader from '../components/ui/SectionHeader';
-import Button from '../components/ui/Button'; // 保留引用
-import Card from '../components/ui/Card';     // 保留引用
 
-// 🔥 引入新做的共用元件
+// 🔥 引入共用元件
 import CustomAlert from '../components/ui/CustomAlert';
 import LoadingOverlay from '../components/ui/LoadingOverlay';
 
@@ -50,6 +49,9 @@ import { useUnreadCount } from '../hooks/useUnreadCount';
 
 const { width } = Dimensions.get('window');
 
+// 🔥 2. 定義 API Key
+const GOOGLE_API_KEY = 'AIzaSyCH_XC3ju87XIlYjfcZd6B8BXr-7wQcYmo';
+
 function HomeMain() {
   const navigation = useNavigation();
   const t = useTheme();
@@ -69,19 +71,9 @@ function HomeMain() {
   const [joinCode, setJoinCode] = useState('');
   const [manualCode, setManualCode] = useState('');
 
-  // Banner
-  const bannerData = [
-    { id: '1', color: '#FFD54F' },
-    { id: '2', color: '#4DB6AC' },
-    { id: '3', color: '#9575CD' },
-  ];
-
-  const renderBanner = ({ item }) => (
-    <View style={[styles.bannerCard, { backgroundColor: item.color }]}>
-      <Text style={styles.bannerText}>✨ 熱門推薦行程 {item.id}</Text>
-      <Text style={styles.bannerSubText}>點擊查看更多細節</Text>
-    </View>
-  );
+  // 🔥 3. 新增推薦行程狀態
+  const [recommendations, setRecommendations] = useState([]);
+  const [recLoading, setRecLoading] = useState(true);
 
   useEffect(() => {
     AsyncStorage.getItem('username').then((u) => setMe(u || 'guest'));
@@ -96,6 +88,57 @@ function HomeMain() {
     return () => unsub();
   }, []);
 
+  // 🔥 4. 取得位置並抓取推薦
+  useEffect(() => {
+    (async () => {
+      try {
+        let { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          console.log('Permission to access location was denied');
+          setRecLoading(false);
+          return;
+        }
+
+        let location = await Location.getCurrentPositionAsync({});
+        const { latitude, longitude } = location.coords;
+        
+        await fetchNearbyPlaces(latitude, longitude);
+      } catch (error) {
+        console.error("Location Error:", error);
+        setRecLoading(false);
+      }
+    })();
+  }, []);
+
+  // 🔥 5. Google Places API 搜尋函式
+  const fetchNearbyPlaces = async (lat, lng) => {
+    try {
+      const radius = 5000; // 搜尋半徑 5公里
+      const type = 'tourist_attraction'; // 搜尋類別：觀光景點
+      const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radius}&type=${type}&language=zh-TW&key=${GOOGLE_API_KEY}`;
+      
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.status === 'OK' && data.results) {
+        // 篩選：有評分、評分 > 4.0、有照片
+        const filtered = data.results.filter(
+          p => p.rating && p.rating >= 4.0 && p.photos && p.photos.length > 0
+        );
+        
+        // 排序：評分由高到低
+        filtered.sort((a, b) => b.rating - a.rating);
+
+        // 取前 5 名
+        setRecommendations(filtered.slice(0, 5));
+      }
+    } catch (e) {
+      console.error("Fetch Places Error:", e);
+    } finally {
+      setRecLoading(false);
+    }
+  };
+
   const myGroups = useMemo(() => {
     if (!me) return [];
     const mine = allGroups.filter((g) => {
@@ -107,7 +150,6 @@ function HomeMain() {
       .slice(0, 5);
   }, [allGroups, me]);
 
-  // 工具：顯示彈窗
   const showAlert = (title, message, onConfirm = null) => {
     setAlertConfig({
       visible: true,
@@ -119,13 +161,10 @@ function HomeMain() {
     });
   };
 
-  // ✅ 新增：前往 Missions
   const goToMissions = () => {
-    // HomeMain 在 Tab 裡，真正的 Stack 在 parent
     navigation.getParent()?.navigate('Missions', { refreshAt: Date.now() });
   };
 
-  // 加入群組邏輯
   const quickJoin = async () => {
     const code = joinCode.trim();
     if (!code) return showAlert('提醒', '請輸入群組 ID');
@@ -160,7 +199,6 @@ function HomeMain() {
     }
   };
 
-  // 加入手動行程邏輯
   const handleOpenManual = () => {
     const code = manualCode.trim();
     if (!code.startsWith('manual-')) {
@@ -171,9 +209,52 @@ function HomeMain() {
     setManualCode('');
   };
 
+  // 🔥 6. 點擊推薦卡片：導航至 MapScreen 並鎖定地點
+  const handlePressRecommendation = (item) => {
+    navigation.getParent()?.navigate('Map', {
+      openDetail: true,
+      focus: {
+        id: item.place_id,
+        placeId: item.place_id,
+        name: item.name,
+        lat: item.geometry.location.lat,
+        lng: item.geometry.location.lng,
+        address: item.vicinity,
+        rating: item.rating,
+        photoUrl: item.photos?.[0]?.photo_reference 
+          ? `https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photo_reference=${item.photos[0].photo_reference}&key=${GOOGLE_API_KEY}`
+          : null
+      }
+    });
+  };
+
+  // 🔥 7. 全新的推薦卡片 Render
+  const renderRecommendationCard = ({ item }) => {
+    const photoUrl = item.photos?.[0]?.photo_reference 
+      ? `https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photo_reference=${item.photos[0].photo_reference}&key=${GOOGLE_API_KEY}`
+      : 'https://via.placeholder.com/400x200?text=No+Image';
+
+    return (
+      <TouchableOpacity 
+        style={styles.recCard} 
+        activeOpacity={0.9}
+        onPress={() => handlePressRecommendation(item)}
+      >
+        <Image source={{ uri: photoUrl }} style={styles.recImage} />
+        <View style={styles.recOverlay}>
+          <View style={styles.recBadge}>
+            <Ionicons name="star" size={12} color="#fff" />
+            <Text style={styles.recBadgeText}>{item.rating}</Text>
+          </View>
+          <Text style={styles.recTitle} numberOfLines={1}>{item.name}</Text>
+          <Text style={styles.recSub} numberOfLines={1}>📍 {item.vicinity}</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
   return (
     <View style={{ flex: 1, backgroundColor: '#f8f9fa' }}>
-      {/* 1. Header & Logo (無搜尋欄，Logo 放大置中) */}
       <View style={styles.headerContainer}>
         <Image
           source={require('../assets/zhuan-ti-logo.png')}
@@ -183,7 +264,7 @@ function HomeMain() {
 
       <SafeAreaView style={styles.container}>
         <ScrollView contentContainerStyle={{ paddingBottom: 100 }}>
-          {/* 2. 我的群組快覽 */}
+          {/* 我的群組快覽 */}
           <View style={styles.sectionContainer}>
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>我的旅程</Text>
@@ -240,7 +321,7 @@ function HomeMain() {
             )}
           </View>
 
-          {/* 3. 快捷功能區 */}
+          {/* 快捷功能區 */}
           <View style={styles.sectionContainer}>
             <Text
               style={[
@@ -292,7 +373,6 @@ function HomeMain() {
                 <Text style={styles.actionText}>歷史行程</Text>
               </TouchableOpacity>
 
-              {/* ✅ 新增：打卡任務 */}
               <TouchableOpacity style={styles.actionBtn} onPress={goToMissions}>
                 <View style={[styles.actionIcon, { backgroundColor: '#ffe4e6' }]}>
                   <Ionicons name="location" size={28} color="#e11d48" />
@@ -302,7 +382,7 @@ function HomeMain() {
             </View>
           </View>
 
-          {/* 4. 加入功能區 */}
+          {/* 加入功能區 */}
           <View style={styles.sectionContainer}>
             <Text
               style={[
@@ -313,7 +393,6 @@ function HomeMain() {
               加入旅程
             </Text>
 
-            {/* 加入群組卡片 */}
             <View style={styles.inputCard}>
               <View style={styles.inputHeader}>
                 <Ionicons name="qr-code-outline" size={20} color="#0b1d3d" />
@@ -334,7 +413,6 @@ function HomeMain() {
               </View>
             </View>
 
-            {/* 加入手動行程卡片 */}
             <View style={[styles.inputCard, { marginTop: 12 }]}>
               <View style={styles.inputHeader}>
                 <Ionicons
@@ -363,24 +441,30 @@ function HomeMain() {
             </View>
           </View>
 
-          {/* 5. Banner 輪播 */}
+          {/* 🔥 8. 探索靈感 (取代原本的假色塊) */}
           <View style={styles.sectionContainer}>
-            <Text
-              style={[
-                styles.sectionTitle,
-                { paddingHorizontal: 20, marginBottom: 12 },
-              ]}
-            >
-              探索靈感
-            </Text>
-            <FlatList
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              data={bannerData}
-              renderItem={renderBanner}
-              keyExtractor={(item) => item.id}
-              contentContainerStyle={{ paddingHorizontal: 20 }}
-            />
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>
+                {recLoading ? '正在搜尋附近好去處...' : '探索周邊靈感 (Rating 4.0+)'}
+              </Text>
+            </View>
+            
+            {recLoading ? (
+              <ActivityIndicator size="small" color="#0b1d3d" style={{marginTop: 20}} />
+            ) : recommendations.length === 0 ? (
+              <View style={{paddingHorizontal: 20}}>
+                <Text style={{color: '#94a3b8'}}>附近暫無推薦景點，請開啟定位或移動位置。</Text>
+              </View>
+            ) : (
+              <FlatList
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                data={recommendations}
+                renderItem={renderRecommendationCard}
+                keyExtractor={(item) => item.place_id}
+                contentContainerStyle={{ paddingHorizontal: 20 }}
+              />
+            )}
           </View>
         </ScrollView>
 
@@ -396,7 +480,6 @@ function HomeMain() {
   );
 }
 
-// ------------------- Navigation 設定 -------------------
 const Tab = createBottomTabNavigator();
 
 export default function HomeScreen() {
@@ -447,7 +530,6 @@ export default function HomeScreen() {
   );
 }
 
-// ------------------- Styles -------------------
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
@@ -530,7 +612,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingHorizontal: 20
   },
-  // ✅ 5個按鈕不擠爆：18% 一排最多5個
   actionBtn: { alignItems: 'center', width: '18%', marginBottom: 12 },
   actionIcon: {
     width: 56,
@@ -571,9 +652,42 @@ const styles = StyleSheet.create({
   joinBtn: { backgroundColor: '#0b1d3d', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 8 },
   joinBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
 
-  bannerCard: { width: 280, height: 120, borderRadius: 16, marginRight: 16, padding: 16, justifyContent: 'center' },
-  bannerText: { fontSize: 18, fontWeight: '800', color: '#fff' },
-  bannerSubText: { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginTop: 4 },
+  // 🔥 9. 推薦卡片樣式
+  recCard: {
+    width: 200,
+    height: 140,
+    borderRadius: 16,
+    marginRight: 16,
+    backgroundColor: '#f1f5f9',
+    overflow: 'hidden', // 讓圖片圓角生效
+    position: 'relative',
+  },
+  recImage: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'cover',
+  },
+  recOverlay: {
+    position: 'absolute',
+    bottom: 0, left: 0, right: 0,
+    padding: 10,
+    backgroundColor: 'rgba(0,0,0,0.4)', // 漸層黑底
+  },
+  recBadge: {
+    position: 'absolute',
+    top: -110, // 往上放
+    right: 8,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2
+  },
+  recBadgeText: { color: '#fbbf24', fontSize: 12, fontWeight: 'bold' },
+  recTitle: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 2 },
+  recSub: { color: '#cbd5e1', fontSize: 10 },
 
   badge: {
     position: 'absolute',
