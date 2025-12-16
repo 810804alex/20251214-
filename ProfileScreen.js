@@ -12,7 +12,7 @@ import {
   StatusBar,
   Platform,
 } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useIsFocused } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons'; 
 
@@ -20,12 +20,21 @@ import { useTheme } from '../theme';
 import Button from '../components/ui/Button';
 import LoadingOverlay from '../components/ui/LoadingOverlay';
 import { db } from '../firebase';
-import { doc, setDoc } from 'firebase/firestore';
+import { 
+  doc, 
+  setDoc, 
+  collection, 
+  query, 
+  where, 
+  getDocs,
+  getDoc
+} from 'firebase/firestore';
 import { useCurrentUser } from '../hooks/useCurrentUser';
 
 export default function ProfileScreen() {
   const t = useTheme();
   const navigation = useNavigation();
+  const isFocused = useIsFocused();
   const { username, user, loading } = useCurrentUser();
 
   // 編輯模式
@@ -37,19 +46,100 @@ export default function ProfileScreen() {
   const [location, setLocation] = useState('');
   const [bio, setBio] = useState('');
   const [photoURL, setPhotoURL] = useState('');
-  const [bucketList, setBucketList] = useState(''); // 新增：夢想清單
+  const [bucketList, setBucketList] = useState('');
   
   const [showUrlInput, setShowUrlInput] = useState(false);
 
-  // 初始化資料
+  // 🔥 真實統計數據 State
+  const [realStats, setRealStats] = useState({
+    cities: 0,
+    journeys: 0,
+    badges: 0
+  });
+
+  // 初始化個人資料
   useEffect(() => {
     if (!user) return;
     setDisplayName(user.displayName ?? '');
     setLocation(user.location ?? '');
     setBio(user.bio ?? '');
     setPhotoURL(user.photoURL ?? '');
-    setBucketList(user.bucketList ?? ''); // 讀取夢想清單
+    setBucketList(user.bucketList ?? '');
   }, [user]);
+
+  // 🔥 修正後的統計數據抓取邏輯
+  useEffect(() => {
+    if (!username) return;
+
+    const fetchRealStats = async () => {
+      try {
+        // 1. 抓取手動行程 (Manual Plans) - 只要是擁有者就算
+        const qManual = query(collection(db, 'manualPlans'), where('owner', '==', username));
+        
+        // 2. 抓取探索城市 (Missions)
+        const qMissions = query(collection(db, 'missions'), where('owner', '==', username));
+
+        // 3. 抓取成就勳章 (Badges)
+        const qBadges = collection(db, 'users', username, 'badges');
+
+        // 4. 🔥 抓取 AI 行程 (更聰明的邏輯)
+        // 為了避免漏掉 "群組行程"，我們先找出 "我參加的所有群組"
+        const groupSnap = await getDocs(collection(db, 'groups'));
+        const myGroupIds = new Set();
+        groupSnap.forEach(doc => {
+          const d = doc.data();
+          // 如果我是成員、擁有者或建立者，就算是我參加的群組
+          if ((d.members && d.members.includes(username)) || d.owner === username || d.creator === username) {
+            myGroupIds.add(doc.id);
+          }
+        });
+
+        // 接著抓取所有 AI 行程，並篩選出 "屬於我參加的群組" 或 "我是擁有者" 的行程
+        const aiSnap = await getDocs(collection(db, 'itineraries'));
+        let aiJourneysCount = 0;
+        aiSnap.forEach(doc => {
+           const d = doc.data();
+           // 條件：(有行程內容) AND (是我建的 OR 是我群組的)
+           if (d.plan || d.legacy?.plan) {
+             if (d.owner === username || (d.groupId && myGroupIds.has(d.groupId))) {
+               aiJourneysCount++;
+             }
+           }
+        });
+
+        // 平行請求其他數據
+        const [snapMan, snapMissions, snapBadges] = await Promise.all([
+          getDocs(qManual),
+          getDocs(qMissions),
+          getDocs(qBadges)
+        ]);
+
+        const totalJourneys = aiJourneysCount + snapMan.size;
+        const badgesCount = snapBadges.size;
+
+        // 計算唯一城市
+        const uniqueCities = new Set();
+        snapMissions.forEach(doc => {
+          const city = doc.data().city;
+          if (city) uniqueCities.add(city.replace('台灣', '').trim()); 
+        });
+
+        setRealStats({
+          journeys: totalJourneys,
+          badges: badgesCount,
+          cities: uniqueCities.size
+        });
+
+      } catch (e) {
+        console.error("統計數據讀取失敗:", e);
+      }
+    };
+
+    if (isFocused) {
+      fetchRealStats();
+    }
+  }, [username, isFocused]); // 當頁面聚焦時重新計算
+
 
   const onSave = async () => {
     if (!username) return;
@@ -62,7 +152,13 @@ export default function ProfileScreen() {
         location: location.trim(),
         bio: bio.trim(),
         photoURL: photoURL.trim(),
-        bucketList: bucketList.trim(), // 儲存夢想清單
+        bucketList: bucketList.trim(),
+        // 同步寫入統計數據
+        stats: {
+            visitedCities: realStats.cities,
+            journeys: realStats.journeys,
+            badges: realStats.badges
+        }
       }, { merge: true });
       
       setIsEditing(false);
@@ -90,24 +186,23 @@ export default function ProfileScreen() {
     ]);
   };
 
-  // 📊 統計數據
-  const stats = useMemo(() => {
-    const s = user?.stats || {};
+  // 📊 統計數據 UI
+  const statsUI = useMemo(() => {
     return [
-      { label: '探索城市', value: s.visitedCities ?? 0, icon: 'map', color: '#0284c7', bg: '#e0f2fe' },
-      { label: '累積旅程', value: s.journeys ?? 0, icon: 'airplane', color: '#d97706', bg: '#fef3c7' },
-      { label: '成就勳章', value: s.badges ?? 0, icon: 'trophy', color: '#16a34a', bg: '#f0fdf4' },
+      { label: '探索城市', value: realStats.cities, icon: 'map', color: '#0284c7', bg: '#e0f2fe' },
+      { label: '累積旅程', value: realStats.journeys, icon: 'airplane', color: '#d97706', bg: '#fef3c7' },
+      { label: '成就勳章', value: realStats.badges, icon: 'trophy', color: '#16a34a', bg: '#f0fdf4' },
     ];
-  }, [user?.stats]);
+  }, [realStats]);
 
-  // 🎖 計算旅人等級 (虛擬邏輯：根據旅程數)
+  // 🎖 計算旅人等級
   const travelerLevel = useMemo(() => {
-    const count = user?.stats?.journeys ?? 0;
-    if (count > 20) return { title: '傳奇探險家', progress: 100, color: '#f59e0b' };
-    if (count > 10) return { title: '資深背包客', progress: 80, color: '#8b5cf6' };
-    if (count > 5) return { title: '城市漫遊者', progress: 50, color: '#0ea5e9' };
-    return { title: '新手旅人', progress: 20, color: '#10b981' }; // 預設
-  }, [user?.stats]);
+    const count = realStats.journeys;
+    if (count >= 20) return { title: '傳奇探險家', progress: 100, color: '#f59e0b', max: 20 };
+    if (count >= 10) return { title: '資深背包客', progress: (count / 20) * 100, color: '#8b5cf6', max: 20 };
+    if (count >= 5) return { title: '城市漫遊者', progress: (count / 10) * 100, color: '#0ea5e9', max: 10 };
+    return { title: '新手旅人', progress: (count / 5) * 100, color: '#10b981', max: 5 }; 
+  }, [realStats.journeys]);
 
   if (!loading && !username) {
     return (
@@ -125,14 +220,14 @@ export default function ProfileScreen() {
       
       <ScrollView contentContainerStyle={{ paddingBottom: 100 }} showsVerticalScrollIndicator={false}>
         
-        {/* 🔥 1. Header Cover */}
+        {/* Header Cover */}
         <View style={styles.headerCover}>
           <TouchableOpacity onPress={onLogout} style={styles.logoutBtn}>
             <Ionicons name="log-out-outline" size={24} color="rgba(255,255,255,0.8)" />
           </TouchableOpacity>
         </View>
 
-        {/* 🔥 2. Profile Card */}
+        {/* Profile Card */}
         <View style={styles.profileCard}>
           <TouchableOpacity 
             style={styles.editModeBtn} 
@@ -202,7 +297,7 @@ export default function ProfileScreen() {
 
           {/* Stats Grid */}
           <View style={styles.statsRow}>
-            {stats.map((stat, index) => (
+            {statsUI.map((stat, index) => (
               <View key={index} style={styles.statItem}>
                 <View style={[styles.statIconBox, { backgroundColor: stat.bg }]}>
                   <Ionicons name={stat.icon} size={20} color={stat.color} />
@@ -214,24 +309,26 @@ export default function ProfileScreen() {
           </View>
         </View>
 
-        {/* 🔥 3. 旅人等級 (填補空缺的新區塊) */}
+        {/* 旅人等級 */}
         <View style={styles.sectionContainer}>
           <Text style={styles.sectionTitle}>旅人等級</Text>
           <View style={styles.levelCard}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
               <Text style={styles.levelTitle}>{travelerLevel.title}</Text>
-              <Text style={styles.levelPercent}>Lv.{user?.stats?.journeys || 1}</Text>
+              <Text style={styles.levelPercent}>Lv.{realStats.journeys}</Text>
             </View>
             <View style={styles.progressBarBg}>
-              <View style={[styles.progressBarFill, { width: `${travelerLevel.progress}%`, backgroundColor: travelerLevel.color }]} />
+              <View style={[styles.progressBarFill, { width: `${Math.min(travelerLevel.progress, 100)}%`, backgroundColor: travelerLevel.color }]} />
             </View>
             <Text style={styles.levelDesc}>
-              {travelerLevel.progress < 100 ? '再多去幾趟旅行來升級！' : '你已經是旅遊大師了！'}
+              {realStats.journeys < travelerLevel.max 
+                ? `再 ${travelerLevel.max - realStats.journeys} 趟旅程即可升級！` 
+                : '你已經是旅遊大師了！'}
             </Text>
           </View>
         </View>
 
-        {/* 🔥 4. 歷史回憶錄 (取代原本的收藏選單) */}
+        {/* 歷史回憶錄 */}
         {!isEditing && (
           <View style={styles.sectionContainer}>
             <TouchableOpacity 
@@ -251,7 +348,7 @@ export default function ProfileScreen() {
           </View>
         )}
 
-        {/* 🔥 5. 關於我 & 夢想清單 (合併在一起顯示) */}
+        {/* 關於我 */}
         <View style={styles.sectionContainer}>
           <Text style={styles.sectionTitle}>關於我</Text>
           <View style={styles.bioBox}>
@@ -269,7 +366,6 @@ export default function ProfileScreen() {
               </Text>
             )}
 
-            {/* 分隔線 */}
             <View style={styles.divider} />
 
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
@@ -303,14 +399,12 @@ const styles = StyleSheet.create({
   centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' },
   emptyText: { color: '#94a3b8', fontSize: 16, marginTop: 12 },
 
-  // Header
   headerCover: {
     height: 150, backgroundColor: '#0b1d3d',
     paddingTop: Platform.OS === 'ios' ? 50 : 30, paddingHorizontal: 20, alignItems: 'flex-end',
   },
   logoutBtn: { padding: 8 },
 
-  // Profile Card
   profileCard: {
     marginTop: -60, marginHorizontal: 16, backgroundColor: '#fff', borderRadius: 20,
     paddingVertical: 24, paddingHorizontal: 16, alignItems: 'center',
@@ -345,11 +439,9 @@ const styles = StyleSheet.create({
   statValue: { fontSize: 18, fontWeight: '800', color: '#1f2937' },
   statLabel: { fontSize: 12, color: '#9ca3af', marginTop: 2 },
 
-  // Sections
   sectionContainer: { marginTop: 24, paddingHorizontal: 20 },
   sectionTitle: { fontSize: 16, fontWeight: '700', color: '#0b1d3d', marginBottom: 10 },
 
-  // Level Card (New)
   levelCard: { backgroundColor: '#fff', borderRadius: 16, padding: 16, borderWidth: 1, borderColor: '#f1f5f9' },
   levelTitle: { fontSize: 16, fontWeight: '800', color: '#334155' },
   levelPercent: { fontSize: 14, fontWeight: '700', color: '#64748b' },
@@ -357,7 +449,6 @@ const styles = StyleSheet.create({
   progressBarFill: { height: '100%', borderRadius: 4 },
   levelDesc: { fontSize: 12, color: '#94a3b8', marginTop: 8 },
 
-  // History Card (New)
   historyCard: {
     backgroundColor: '#fff', borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center',
     shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.05, shadowRadius: 8, elevation: 3,
@@ -368,7 +459,6 @@ const styles = StyleSheet.create({
   historyTitle: { fontSize: 16, fontWeight: '700', color: '#1e293b' },
   historySub: { fontSize: 13, color: '#64748b', marginTop: 2 },
 
-  // Bio & Bucket List
   bioBox: { backgroundColor: '#fff', borderRadius: 12, padding: 16, borderWidth: 1, borderColor: '#e5e7eb' },
   bioText: { fontSize: 15, color: '#4b5563', lineHeight: 24 },
   divider: { height: 1, backgroundColor: '#f1f5f9', marginVertical: 12 },

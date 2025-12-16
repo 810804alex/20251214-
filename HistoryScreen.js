@@ -18,6 +18,8 @@ import {
   getDocs,
   deleteDoc,
   doc,
+  query,
+  where, // 🔥 新增引用
 } from 'firebase/firestore';
 import { db } from '../firebase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -25,7 +27,6 @@ import * as Clipboard from 'expo-clipboard';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons'; 
 
 import { useTheme } from '../theme';
-import Screen from '../components/ui/Screen';
 
 // 🎨 定義風格顏色
 const THEME_COLORS = {
@@ -58,25 +59,48 @@ export default function HistoryScreen({ navigation }) {
       const me = u || 'guest';
       setUserName(me);
 
-      // 1. 讀取 AI 行程
+      // 🔥 0. 先取得我參加的群組 ID (白名單)
+      const myGroupIds = new Set();
+      const groupSnap = await getDocs(collection(db, 'groups'));
+      groupSnap.forEach(doc => {
+        const d = doc.data();
+        // 如果我是成員、擁有者或建立者，就算是我參加的群組
+        if ((d.members && d.members.includes(me)) || d.owner === me || d.creator === me) {
+          myGroupIds.add(doc.id);
+        }
+      });
+
+      // 🔥 1. 讀取 AI 行程 (嚴格篩選)
       const itSnap = await getDocs(collection(db, 'itineraries'));
       const ai = [];
       itSnap.forEach((docSnap) => {
         const d = docSnap.data() || {};
-        if (d.owner && d.owner !== me) return; 
-        ai.push({ id: docSnap.id, ...d });
+        
+        // 判斷條件：(我是擁有者) OR (這是屬於我群組的行程)
+        const isMine = d.owner === me;
+        const isMyGroup = d.groupId && myGroupIds.has(d.groupId);
+
+        if (isMine || isMyGroup) {
+           ai.push({ id: docSnap.id, ...d });
+        }
+        // 其他不符合條件的 (包含沒有 owner 且不屬於我群組的) 通通不加入
       });
+      
+      // 依照建立時間排序 (新到舊)
       ai.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
       setAiTrips(ai);
 
-      // 2. 讀取手動行程
-      const mpSnap = await getDocs(collection(db, 'manualPlans'));
+      // 🔥 2. 讀取手動行程 (只抓取 owner 是我的)
+      // 使用 query 直接在資料庫層過濾，效率更好且不會抓到別人的
+      const qManual = query(collection(db, 'manualPlans'), where('owner', '==', me));
+      const mpSnap = await getDocs(qManual);
+      
       const manual = [];
       mpSnap.forEach((docSnap) => {
         const d = docSnap.data() || {};
-        if (d.owner && d.owner !== me) return;
         manual.push({ id: docSnap.id, ...d });
       });
+      
       manual.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
       setManualTrips(manual);
 

@@ -38,7 +38,7 @@ import { addNotification } from '../services/NotificationService';
 const REGIONS = ['北部', '中部', '南部', '東部', '離島'];
 const TAGS = Object.keys(TAG_TO_TYPES || {});
 
-// Chip 元件 (手寫樣式，為了跟首頁風格統一)
+// Chip 元件
 const SelectionChip = ({ label, active, onPress }) => (
   <TouchableOpacity
     onPress={onPress}
@@ -119,24 +119,35 @@ export default function GroupCreateScreen() {
 
       setLoading(false);
 
-      // 4. 🔥 成功彈窗：直接跳轉行程頁 (觸發 AI)
+      // 4. 🔥 成功彈窗：修改這裡的跳轉邏輯
       showAlert(
         '建立成功',
         `群組 ID：${docRef.id}\n\n即將為您生成專屬行程...`,
         () => {
           setAlertConfig(prev => ({ ...prev, visible: false }));
           
-          // 🔥 關鍵修改：直接導航去 Itinerary，並帶入參數
-          // ItineraryScreen 收到這些參數後，會自動觸發 buildItinerary(false) 開始跑 AI
-          navigation.navigate('Itinerary', { 
-            groupId: docRef.id, 
-            groupName: groupName.trim(),
-            region: region,
-            days: d,
-            tags: pickedTags
+          // 🔥 核心修改：使用 reset 重設導航歷史
+          // 這樣堆疊順序變成：Home -> GroupList -> Itinerary
+          // 所以按返回時，會回到 GroupList，而不是 GroupCreate
+          navigation.reset({
+            index: 2,
+            routes: [
+              { name: 'Home' },      // 確保最底層是首頁
+              { name: 'GroupList' }, // 中間層是群組列表 (這樣返回就會到這)
+              { 
+                name: 'Itinerary',   // 最上層是行程頁 (目前顯示的)
+                params: { 
+                  groupId: docRef.id, 
+                  groupName: groupName.trim(),
+                  region: region,
+                  days: d,
+                  tags: pickedTags
+                }
+              },
+            ],
           });
         },
-        "前往行程" // 按鈕文字
+        "前往行程"
       );
 
     } catch (e) {

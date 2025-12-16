@@ -1,726 +1,499 @@
 // screens/MissionsScreen.js
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import {
-  SafeAreaView,
   View,
   Text,
   StyleSheet,
+  SafeAreaView,
   SectionList,
   TouchableOpacity,
+  Modal,
   Alert,
   ActivityIndicator,
-  Modal,
-  Pressable,
-  ScrollView,
-  Platform,
   StatusBar,
+  ScrollView,
+  Pressable,
+  Platform,
+  Vibration 
 } from 'react-native';
-import * as Location from 'expo-location';
+import { useNavigation, useIsFocused, useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNavigation } from '@react-navigation/native';
-import {
-  collection,
-  getDocs,
-  deleteDoc,
-  doc,
+import * as Location from 'expo-location';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+
+// Firebase
+import { 
+  collection, 
+  getDocs, 
+  doc, 
+  deleteDoc, 
+  writeBatch, 
   serverTimestamp,
-  writeBatch,
+  updateDoc 
 } from 'firebase/firestore';
+import { db } from '../firebase'; 
 
-import { db } from '../firebase';
-import { metersBetween } from '../services/CheckInService';
-import {
-  awardBadgeForMission,
-  hasCompletedMission,
-  getCompletedMissionIdSet,
-} from '../services/BadgeService';
+const GOOGLE_API_KEY = 'AIzaSyCH_XC3ju87XIlYjfcZd6B8BXr-7wQcYmo';
 
-const DIST_THRESHOLD = 100;
-const MAX_IMPORT = 60;
-const BATCH_LIMIT = 400;
+const COLORS = {
+  primary: '#0b1d3d',
+  accent: '#10b981',
+  bg: '#f8f9fa',
+  text: '#334155',
+  subText: '#94a3b8',
+  border: '#e2e8f0',
+  white: '#ffffff',
+  debug: '#ef4444',
+  navBlue: '#007AFF',
+  completedBg: '#f3f4f6', 
+  completedText: '#9ca3af', 
+};
 
-/* ------------------------- utils ------------------------- */
-
-function toNum(x) {
-  const n = typeof x === 'string' ? parseFloat(x) : Number(x);
-  return Number.isFinite(n) ? n : null;
+function getDistance(lat1, lon1, lat2, lon2) {
+  if (!lat1 || !lon1 || !lat2 || !lon2) return Infinity;
+  const R = 6371e3; 
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
 }
 
-function normalizeLatLng(lat, lng) {
-  const a = toNum(lat);
-  const b = toNum(lng);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  if (Math.abs(a) > 90 || Math.abs(b) > 180) return null;
-  if (a === 0 && b === 0) return null;
-  return { lat: a, lng: b };
+// 🔍 Google API 查座標
+async function fetchGoogleCoordinates(queryStr) {
+  if (!GOOGLE_API_KEY) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
+    const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(queryStr)}&key=${GOOGLE_API_KEY}&language=zh-TW&region=tw`;
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    const data = await response.json();
+    if (data.status === 'OK' && data.results?.length > 0) {
+      const result = data.results[0];
+      return { 
+        lat: result.geometry.location.lat, 
+        lng: result.geometry.location.lng, 
+        address: result.formatted_address, 
+        placeId: result.place_id 
+      };
+    }
+    return null;
+  } catch (error) { return null; }
 }
 
-function pickLatLng(p) {
-  const rawLat =
-    p?.lat ?? p?.latitude ?? p?.location?.lat ?? p?.geometry?.location?.lat ?? null;
-  const rawLng =
-    p?.lng ?? p?.longitude ?? p?.location?.lng ?? p?.geometry?.location?.lng ?? null;
-
-  const latVal = typeof rawLat === 'function' ? rawLat() : rawLat;
-  const lngVal = typeof rawLng === 'function' ? rawLng() : rawLng;
-
-  return normalizeLatLng(latVal, lngVal);
-}
-
-function hashStr(s) {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) {
-    h = ((h << 5) + h) + s.charCodeAt(i);
-    h |= 0;
-  }
-  return Math.abs(h).toString(36);
-}
-
-function makeMissionDocId(place) {
-  const placeId = place?.placeId || place?.id || null;
-  if (placeId) return String(placeId);
-
-  const ll = pickLatLng(place);
-  const key = `${place?.name || 'place'}|${ll?.lat}|${ll?.lng}`;
-  return `m_${hashStr(key)}`;
-}
-
-// ✅ 抽景點時，把「第幾天」一起帶出來
 function extractPlacesFromPlan(planLike) {
   if (!planLike) return [];
-
-  const daily = Array.isArray(planLike.dailyPlans) ? planLike.dailyPlans : null;
-  const plans = Array.isArray(planLike.plans) ? planLike.plans : null;
-  const daysArr = daily || plans || [];
-
+  const daysArr = planLike.dailyPlans || planLike.plans || (Array.isArray(planLike) ? planLike : []);
   const out = [];
-  for (let i = 0; i < daysArr.length; i++) {
-    const dayObj = daysArr[i];
-    const dayNoRaw = dayObj?.day ?? dayObj?.dayNo ?? dayObj?.dayIndex ?? (i + 1);
-    const dayNo = Number.isFinite(Number(dayNoRaw)) ? Number(dayNoRaw) : (i + 1);
-
-    const places = Array.isArray(dayObj?.places)
-      ? dayObj.places
-      : Array.isArray(dayObj?.items)
-      ? dayObj.items
-      : [];
-
-    for (const p of places) {
-      const ll = pickLatLng(p);
-      if (!ll) continue;
-      out.push({ ...p, lat: ll.lat, lng: ll.lng, day: dayNo });
-    }
-  }
-
-  // 去重：placeId/id 優先，否則 name+lat+lng
-  const seen = new Set();
-  const uniq = [];
-  for (const p of out) {
-    const key = p.placeId || p.id || `${p.name || ''}|${p.lat}|${p.lng}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniq.push(p);
-  }
-  return uniq;
+  daysArr.forEach((dayObj, i) => {
+    const dayNo = dayObj.day || (i + 1);
+    const places = dayObj.places || dayObj.items || dayObj.spots || [];
+    places.forEach((p, idx) => {
+      const lat = p.lat || p.location?.lat || p.geometry?.location?.lat;
+      const lng = p.lng || p.location?.lng || p.geometry?.location?.lng;
+      out.push({
+        ...p,
+        lat: lat ? parseFloat(lat) : null,
+        lng: lng ? parseFloat(lng) : null,
+        day: dayNo,
+        sequence: idx + 1
+      });
+    });
+  });
+  return out;
 }
 
-/* ------------------------- screen ------------------------- */
-
-export default function MissionsScreen({ route }) {
+export default function MissionsScreen() {
   const navigation = useNavigation();
-  const topInset = Platform.OS === 'android' ? (StatusBar.currentHeight || 0) : 0;
+  const isFocused = useIsFocused();
 
-  const [userId, setUserId] = useState(route?.params?.userId ?? 'demo@user.com');
+  const [userId, setUserId] = useState('guest');
+  const [myLoc, setMyLoc] = useState(null);
+  const [missions, setMissions] = useState([]); 
+  const [historyTrips, setHistoryTrips] = useState([]); 
+  const [loading, setLoading] = useState(true);
+  const [importModalVisible, setImportModalVisible] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState('');
+  const [debugMsg, setDebugMsg] = useState('');
+
   useEffect(() => {
-    AsyncStorage.getItem('username').then((u) => u && setUserId(u));
+    AsyncStorage.getItem('username').then(u => u && setUserId(u));
+    Location.requestForegroundPermissionsAsync().then(({ status }) => {
+      if (status === 'granted') {
+        Location.getCurrentPositionAsync({}).then(loc => {
+          setMyLoc({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+        });
+      }
+    });
   }, []);
 
-  const [loc, setLoc] = useState(null);
-  const [missions, setMissions] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  const [completedSet, setCompletedSet] = useState(new Set());
-
-  const [aiTrips, setAiTrips] = useState([]);
-  const [manualTrips, setManualTrips] = useState([]);
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const [importing, setImporting] = useState(false);
-
-  // ✅ 新增：用來過濾顯示特定行程的 ID 與名稱
-  const [filterTripId, setFilterTripId] = useState(null);
-  const [filterTripName, setFilterTripName] = useState(null);
-
-  const refreshAt = route?.params?.refreshAt;
-
-  const getMyLocation = async () => {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('需要定位權限才能打卡');
-      return null;
-    }
-    const pos = await Location.getCurrentPositionAsync({});
-    const ll = normalizeLatLng(pos?.coords?.latitude, pos?.coords?.longitude);
-    if (!ll) return null;
-    setLoc(ll);
-    return ll;
+  const fetchMissions = async () => {
+    try {
+      const snap = await getDocs(collection(db, 'missions'));
+      const list = [];
+      snap.forEach(doc => {
+        const d = doc.data();
+        if (d.owner === userId || !d.owner) {
+          list.push({ id: doc.id, ...d });
+        }
+      });
+      setMissions(list);
+    } catch (e) { console.error(e); } finally { setLoading(false); }
   };
 
-  const loadMissions = async (my) => {
-    const snap = await getDocs(collection(db, 'missions'));
-    const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  useFocusEffect(useCallback(() => { fetchMissions(); }, [userId]));
 
-    const visible = all.filter((m) => !m.owner || m.owner === userId);
-
-    const list = visible.map((m) => {
-      const ll = normalizeLatLng(m.lat, m.lng);
-      const dayNo = Number.isFinite(Number(m.day)) ? Number(m.day) : null;
-
-      if (!ll || !my) {
-        return {
-          ...m,
-          day: dayNo,
-          lat: ll?.lat ?? m.lat,
-          lng: ll?.lng ?? m.lng,
-          distance: Infinity,
-          _badCoord: true,
-        };
-      }
-      const dist = metersBetween(my.lat, my.lng, ll.lat, ll.lng);
-      return {
-        ...m,
-        day: dayNo,
-        lat: ll.lat,
-        lng: ll.lng,
-        distance: Number.isFinite(dist) ? dist : Infinity,
-        _badCoord: !Number.isFinite(dist),
-      };
-    });
-
-    setMissions(list);
+  const fetchHistoryTrips = async () => {
+    setImporting(true);
+    setImportProgress('讀取行程列表...');
+    const results = [];
+    const myGroupIds = new Set(); 
+    try {
+      const groupSnap = await getDocs(collection(db, 'groups'));
+      groupSnap.forEach(doc => {
+        const d = doc.data();
+        if ((d.members && d.members.includes(userId)) || d.owner === userId || d.creator === userId) {
+          myGroupIds.add(doc.id);
+        }
+      });
+      const aiSnap = await getDocs(collection(db, 'itineraries'));
+      aiSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.plan || d.legacy?.plan) {
+           const isMine = d.owner === userId;
+           const isMyGroup = d.groupId && myGroupIds.has(d.groupId);
+           if (isMine || isMyGroup) {
+             results.push({ 
+               id: doc.id, type: 'AI', title: d.groupName || d.name, region: d.region, days: d.days, rawPlan: d.plan || d.legacy?.plan, groupId: d.groupId 
+             });
+           }
+        }
+      });
+      const manualSnap = await getDocs(collection(db, 'manualPlans'));
+      manualSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.owner === userId) {
+          results.push({ 
+            id: doc.id, type: 'Manual', title: d.title || d.name, region: '自訂', days: d.days, rawPlan: d 
+          });
+        }
+      });
+      setHistoryTrips(results);
+      setImportModalVisible(true);
+    } catch (e) { Alert.alert("讀取失敗", e.message); } finally { setImporting(false); setImportProgress(''); }
   };
 
-  const loadTrips = async () => {
-    const itSnap = await getDocs(collection(db, 'itineraries'));
-    const ai = [];
-    itSnap.forEach((docSnap) => {
-      const d = docSnap.data() || {};
-      if (d.owner && d.owner !== userId) return;
-      if (!d?.legacy?.plan) return;
-      ai.push({ id: docSnap.id, ...d });
-    });
-    ai.sort((a, b) => {
-      const ta = a.updatedAt?.toMillis?.() ?? (a.createdAt?.toMillis?.() ?? 0);
-      const tb = b.updatedAt?.toMillis?.() ?? (b.createdAt?.toMillis?.() ?? 0);
-      return tb - ta;
-    });
-    setAiTrips(ai);
-
-    const mpSnap = await getDocs(collection(db, 'manualPlans'));
-    const manual = [];
-    mpSnap.forEach((docSnap) => {
-      const d = docSnap.data() || {};
-      if (d.owner && d.owner !== userId) return;
-      if (!d?.plans && !d?.dailyPlans) return;
-      manual.push({ id: docSnap.id, ...d });
-    });
-    manual.sort((a, b) => {
-      const ta = a.updatedAt?.toMillis?.() ?? (a.createdAt?.toMillis?.() ?? 0);
-      const tb = b.updatedAt?.toMillis?.() ?? (b.createdAt?.toMillis?.() ?? 0);
-      return tb - ta;
-    });
-    setManualTrips(manual);
-  };
-
-  const loadAll = async () => {
-    const my = await getMyLocation();
-    await loadMissions(my);
-
-    const set = await getCompletedMissionIdSet(userId);
-    setCompletedSet(set);
-
-    await loadTrips();
-  };
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        setLoading(true);
-        await loadAll();
-      } catch (err) {
-        console.warn('Missions init error:', err);
-        Alert.alert('讀取失敗', '無法載入任務清單，請稍後再試');
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-    return () => { alive = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshAt, userId]);
-
-  const handleCheckIn = async (mission) => {
-    if (!loc) return;
-
-    const ll = normalizeLatLng(mission.lat, mission.lng);
-    if (!ll) {
-      Alert.alert('座標異常', '這個任務沒有有效座標，無法打卡。');
-      return;
-    }
-
-    const d = metersBetween(loc.lat, loc.lng, ll.lat, ll.lng);
-    if (!Number.isFinite(d)) {
-      Alert.alert('距離計算失敗', '請稍後再試。');
-      return;
-    }
-
-    const done = await hasCompletedMission(userId, String(mission.id));
-    if (done) {
-      Alert.alert('已完成', '你已拿過這個徽章囉！');
-      return;
-    }
-
-    if (d <= DIST_THRESHOLD) {
-      await awardBadgeForMission(userId, mission);
-      const nextSet = new Set(completedSet);
-      nextSet.add(String(mission.id));
-      setCompletedSet(nextSet);
-      Alert.alert('🎉 打卡成功', `獲得徽章：${mission.badgeIcon} ${mission.name}`);
-    } else {
-      Alert.alert('還差一點', `距離約 ${Math.round(d)} 公尺，再靠近一點點！`);
-    }
-  };
-
-  const handleDeleteMission = (mission) => {
+  const confirmAndImport = (trip) => {
     Alert.alert(
-      '刪除任務',
-      `確定要刪除「${mission.name}」嗎？\n此動作無法復原。`,
+      "匯入確認",
+      "即將匯入新行程。\n\n保留：已完成任務、額外手動任務\n移除：舊行程的未完成任務",
       [
-        { text: '取消', style: 'cancel' },
-        {
-          text: '刪除',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteDoc(doc(db, 'missions', String(mission.id)));
-              setMissions((prev) => prev.filter((m) => String(m.id) !== String(mission.id)));
-            } catch (e) {
-              console.error(e);
-              Alert.alert('刪除失敗', '可能沒有權限（Firestore rules），或網路異常。');
-            }
-          },
-        },
+        { text: "取消", style: "cancel" },
+        { text: "開始匯入", style: 'destructive', onPress: () => handleImport(trip) }
       ]
     );
+  };
+
+  // [Modified] 匯入邏輯：保留已完成和額外任務
+  const handleImport = async (trip) => {
+    let planData = trip.rawPlan;
+    if (!planData && trip.type === 'Group') {
+        const found = historyTrips.find(t => t.type === 'AI' && t.groupId === trip.id);
+        if (found) planData = found.rawPlan;
+        else { Alert.alert('無法匯入', '此行程資料不完整。'); return; }
+    }
+    setImportModalVisible(false);
+    setImporting(true);
+    setImportProgress('準備匯入...');
+    try {
+      const places = extractPlacesFromPlan(planData);
+      if (places.length === 0) throw new Error("行程中沒有景點");
+
+      const batchDelete = writeBatch(db);
+      
+      // [Change] 這裡不再無差別刪除，而是有條件刪除
+      missions.forEach(m => {
+          if(m.owner === userId) {
+              // 判斷是否為手動加入的額外任務 (通常手動加入的 icon 是 📍 或是沒有 day 屬性)
+              const isManualExtra = m.badgeIcon === '📍' || !m.day;
+              const isCompleted = m.isCompleted;
+
+              // 如果既不是已完成，也不是手動額外任務，才視為「舊行程的過期任務」進行刪除
+              if (!isCompleted && !isManualExtra) {
+                  batchDelete.delete(doc(db, 'missions', m.id));
+              }
+          }
+      });
+      await batchDelete.commit();
+
+      const batch = writeBatch(db);
+      // 我們不重新 fetch，直接用過濾後的本地 state 加上新的 mission
+      // 但為了確保資料一致，還是重新組裝比較保險，這裡先把新任務加進去
+      
+      let processedCount = 0;
+      for (const p of places) {
+        setImportProgress(`匯入中 ${processedCount + 1}/${places.length}...`);
+        let lat = p.lat, lng = p.lng, addr = p.address, pid = p.placeId;
+        if (!lat || !lng) {
+           const queryStr = `${p.name} ${trip.region || ''} 台灣`;
+           const gRes = await fetchGoogleCoordinates(queryStr);
+           if (gRes) { lat = gRes.lat; lng = gRes.lng; addr = gRes.address; pid = gRes.placeId; }
+        }
+        if (lat && lng) {
+            const docId = `m_${Math.random().toString(36).substr(2, 9)}`;
+            const ref = doc(db, 'missions', docId);
+            const missionData = {
+                id: docId, owner: userId, name: p.name, lat, lng, placeId: pid || null, city: addr || '',
+                day: p.day, sequence: p.sequence, sourceTripId: trip.id, sourceTripName: trip.title,
+                badgeIcon: trip.type === 'Manual' ? '📝' : '🤖', createdAt: serverTimestamp(), isCompleted: false
+            };
+            batch.set(ref, missionData, { merge: true });
+        }
+        processedCount++;
+      }
+      await batch.commit();
+      
+      // 匯入完成後，重新讀取一次資料庫，這樣畫面就會包含「保留的舊任務」+「匯入的新任務」
+      await fetchMissions();
+      
+      Alert.alert('匯入成功', `已切換至「${trip.title}」！\n(已完成與額外任務均保留)`);
+    } catch (e) { console.error(e); Alert.alert('匯入錯誤', e.message); } finally { setImporting(false); setImportProgress(''); }
   };
 
   const goToMap = (mission) => {
-    const ll = normalizeLatLng(mission.lat, mission.lng);
-    if (!ll) {
-      Alert.alert('座標異常', '這個任務沒有有效座標，無法開啟地圖。');
-      return;
-    }
-
-    const focus = {
-      id: mission.placeId || mission.id,
-      placeId: mission.placeId || null,
-      name: mission.name,
-      lat: ll.lat,
-      lng: ll.lng,
-      latitude: ll.lat,
-      longitude: ll.lng,
-      address: mission.city || '',
-      badgeIcon: mission.badgeIcon || '📍',
-      rating: mission.rating || null,
-      photoUrl: mission.photoUrl || null,
-      isMission: true,
-    };
-
-    const params = {
-      focus,
-      openDetail: true,
-      from: 'Missions',
-      returnTo: { name: 'Missions', params: { refreshAt: Date.now() } },
-    };
-
-    const parent = navigation.getParent?.();
-    const parentState = parent?.getState?.();
-    const hasMapInParent =
-      !!parentState?.routeNames?.includes?.('Map') ||
-      !!parentState?.routes?.some?.((r) => r.name === 'Map');
-
-    if (hasMapInParent) { parent.navigate('Map', params); return; }
-
-    const grand = parent?.getParent?.();
-    const grandState = grand?.getState?.();
-    const hasMapInGrand =
-      !!grandState?.routeNames?.includes?.('Map') ||
-      !!grandState?.routes?.some?.((r) => r.name === 'Map');
-
-    if (hasMapInGrand) { grand.navigate('Map', params); return; }
-
-    navigation.navigate('Map', params);
+    navigation.navigate('Map', {
+        openDetail: true,
+        focus: { id: mission.placeId || mission.id, placeId: mission.placeId, name: mission.name, lat: mission.lat, lng: mission.lng, latitude: mission.lat, longitude: mission.lng, address: mission.city },
+        from: 'Missions'
+    });
   };
 
-  const importPlacesAsMissions = async (places, meta = {}) => {
-    if (!places?.length) {
-      Alert.alert('沒有可匯入的景點', '這個行程裡找不到有效座標的景點。');
-      return;
-    }
+  // 🔥 核心邏輯：依照 Day 分組與排序
+  const groupedMissions = useMemo(() => {
+    const processed = missions.map(m => ({ ...m, dist: myLoc ? getDistance(myLoc.lat, myLoc.lng, m.lat, m.lng) : null }));
+    const activeMissions = processed.filter(m => !m.isCompleted);
+    const completedMissions = processed.filter(m => m.isCompleted);
 
-    setImporting(true);
-    try {
-      const slice = places.slice(0, Math.min(places.length, MAX_IMPORT));
-
-      let batch = writeBatch(db);
-      let countInBatch = 0;
-      let total = 0;
-
-      const flush = async () => {
-        if (countInBatch === 0) return;
-        await batch.commit();
-        batch = writeBatch(db);
-        countInBatch = 0;
-      };
-
-      for (const p of slice) {
-        const ll = normalizeLatLng(p.lat, p.lng);
-        if (!ll) continue;
-
-        const id = makeMissionDocId(p);
-        const dayNo = Number.isFinite(Number(p.day)) ? Number(p.day) : null;
-
-        const payload = {
-          owner: userId,
-          name: p.name || '未命名地點',
-          placeId: p.placeId || p.id || null,
-          lat: ll.lat,
-          lng: ll.lng,
-          day: dayNo, // ✅ 存第幾天，後面才能 Day1/Day2 排序
-          city: p.address || p.city || meta.region || '',
-          rating: p.rating ?? null,
-          photoUrl: p.photoUrl ?? p.photo ?? null,
-          badgeIcon: meta.badgeIcon || '📍',
-          source: meta.source || 'history',
-          sourceTripId: meta.tripId || null,
-          sourceTripName: meta.tripName || null,
-          updatedAt: serverTimestamp(),
-          createdAt: serverTimestamp(),
-        };
-
-        batch.set(doc(db, 'missions', String(id)), payload, { merge: true });
-        countInBatch += 1;
-        total += 1;
-
-        if (countInBatch >= BATCH_LIMIT) await flush();
-      }
-
-      await flush();
-
-      Alert.alert('✅ 匯入完成', `已切換至行程：${meta.tripName || '未命名'}`);
-      setPickerOpen(false);
-
-      // ✅ 匯入後，直接設定過濾條件，只顯示這個行程
-      if (meta.tripId) {
-        setFilterTripId(meta.tripId);
-        setFilterTripName(meta.tripName || '自訂行程');
-      }
-
-      const my = loc || (await getMyLocation());
-      await loadMissions(my);
-      const set = await getCompletedMissionIdSet(userId);
-      setCompletedSet(set);
-    } catch (e) {
-      console.error(e);
-      Alert.alert('匯入失敗', '可能沒有寫入權限（Firestore rules），或網路異常。');
-    } finally {
-      setImporting(false);
-    }
-  };
-
-  const importFromAiTrip = (trip) => {
-    const plan = trip?.legacy?.plan || null;
-    const places = extractPlacesFromPlan(plan);
-
-    Alert.alert(
-      '匯入任務',
-      `要把「${trip.groupName || '未命名行程'}」的景點匯入成任務嗎？\n（會自動去重、只匯入前 ${MAX_IMPORT} 個）`,
-      [
-        { text: '取消', style: 'cancel' },
-        {
-          text: '確定',
-          onPress: () =>
-            importPlacesAsMissions(places, {
-              source: 'itineraries',
-              tripId: trip.groupId || trip.id,
-              tripName: trip.groupName || '未命名行程',
-              region: trip.region || '',
-              badgeIcon: '📍',
-            }),
-        },
-      ]
-    );
-  };
-
-  const importFromManualTrip = (planDoc) => {
-    const places = extractPlacesFromPlan(planDoc);
-
-    Alert.alert(
-      '匯入任務',
-      `要把「${planDoc.title || planDoc.name || planDoc.id}」的景點匯入成任務嗎？\n（會自動去重、只匯入前 ${MAX_IMPORT} 個）`,
-      [
-        { text: '取消', style: 'cancel' },
-        {
-          text: '確定',
-          onPress: () =>
-            importPlacesAsMissions(places, {
-              source: 'manualPlans',
-              tripId: planDoc.planId || planDoc.id,
-              tripName: planDoc.title || planDoc.name || planDoc.id,
-              region: '',
-              badgeIcon: '📍',
-            }),
-        },
-      ]
-    );
-  };
-
-  const header = useMemo(() => {
-    return (
-      <View style={{ paddingHorizontal: 16, paddingTop: 14, paddingBottom: 10 }}>
-        <Text style={styles.title}>📍 附近任務</Text>
-        
-        {/* ✅ 修改：顯示目前過濾狀態 */}
-        {filterTripId ? (
-           <View style={{ marginBottom: 8 }}>
-             <Text style={styles.sub}>
-               正在顯示行程：<Text style={{ fontWeight: 'bold', color: '#0b1d3d' }}>{filterTripName}</Text>
-             </Text>
-             <Text style={styles.sub}>（其他行程的任務已隱藏）</Text>
-           </View>
-        ) : (
-           <Text style={styles.sub}>（靠近 ≤ {DIST_THRESHOLD}m 可完成打卡）</Text>
-        )}
-
-        <View style={styles.sectionRow}>
-          <Text style={styles.sectionTitle}>
-             {filterTripId ? '行程任務列表' : '所有未完成任務'}
-          </Text>
-
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            {/* 如果正在過濾，顯示「顯示全部」按鈕 */}
-            {filterTripId && (
-              <TouchableOpacity 
-                style={[styles.importTopBtn, { borderColor: '#666' }]} 
-                onPress={() => {
-                  setFilterTripId(null);
-                  setFilterTripName(null);
-                }}
-              >
-                <Text style={[styles.importTopBtnText, { color: '#666' }]}>顯示全部</Text>
-              </TouchableOpacity>
-            )}
-
-            <TouchableOpacity style={styles.importTopBtn} onPress={() => setPickerOpen(true)}>
-              <Text style={styles.importTopBtnText}>
-                {filterTripId ? '切換行程' : '匯入行程'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {importing ? <Text style={styles.gray}>匯入中…</Text> : null}
-      </View>
-    );
-  }, [importing, filterTripId, filterTripName]);
-
-  const makeEmptyItem = (key, text) => ({ _empty: true, id: key, _emptyText: text });
-
-  // ✅ Day1/Day2 排序 + 根據 filterTripId 過濾 (含已完成)
-  const sections = useMemo(() => {
-    // 1. 先過濾出「要顯示的任務」
-    let visibleMissions = missions;
-    
-    // 如果有設定 filterTripId，就只留該行程的任務
-    if (filterTripId) {
-      visibleMissions = missions.filter(m => m.sourceTripId === filterTripId);
-    }
-
-    const isDone = (m) => completedSet.has(String(m.id));
-    const incomplete = [];
-    const completed = [];
-
-    // 2. 針對過濾後的任務進行分類
-    for (const m of visibleMissions) {
-      if (isDone(m)) completed.push(m);
-      else incomplete.push(m);
-    }
-
-    const byDist = (a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity);
-
-    // 分組：day -> items
-    const dayMap = new Map(); // key: number | 'none'
-    for (const m of incomplete) {
-      const d = Number.isFinite(Number(m.day)) ? Number(m.day) : null;
-      const key = d ?? 'none';
-      if (!dayMap.has(key)) dayMap.set(key, []);
-      dayMap.get(key).push(m);
-    }
-
-    // 依 day 由小到大
-    const dayKeys = [...dayMap.keys()]
-      .filter((k) => k !== 'none')
-      .sort((a, b) => Number(a) - Number(b));
-
-    const out = [];
-
-    for (const k of dayKeys) {
-      const arr = dayMap.get(k) || [];
-      arr.sort(byDist);
-      out.push({
-        title: `Day ${k}（依距離）`,
-        data: arr,
-      });
-    }
-
-    if (dayMap.has('none')) {
-      const arr = dayMap.get('none') || [];
-      arr.sort(byDist);
-      out.push({
-        title: '未分天數（依距離）',
-        data: arr.length ? arr : [makeEmptyItem('__empty_none__', '這裡目前沒有未完成任務')],
-      });
-    }
-
-    completed.sort(byDist);
-    
-    // 根據是否有 Filter 改變標題
-    const completedTitle = filterTripId 
-      ? '✅ 此行程已完成（依距離）' 
-      : '✅ 全部已完成（依距離）';
-
-    out.push({
-      title: completedTitle,
-      data: completed.length ? completed : [makeEmptyItem('__empty_done__', '目前沒有已完成的任務')],
+    // [Modified] 排序邏輯：有 Day 的排前面，沒 Day (額外任務) 排後面
+    activeMissions.sort((a, b) => {
+      // 如果是數字 Day，保持原值；如果是 undefined/null (額外任務)，給一個超大數字讓它排後面
+      const dayA = typeof a.day === 'number' ? a.day : 9999;
+      const dayB = typeof b.day === 'number' ? b.day : 9999;
+      
+      if (dayA !== dayB) return dayA - dayB;
+      
+      const seqA = Number(a.sequence) || 999; 
+      const seqB = Number(b.sequence) || 999;
+      return seqA - seqB;
     });
 
-    return out;
-  }, [missions, completedSet, filterTripId]);
+    const groupsObj = {};
+    activeMissions.forEach(m => {
+      // [Modified] 如果沒有 day，歸類為 "額外任務"
+      const d = (typeof m.day === 'number') ? `Day ${m.day}` : '額外任務';
+      if (!groupsObj[d]) groupsObj[d] = [];
+      groupsObj[d].push(m);
+    });
 
-  if (loading) {
-    return (
-      <SafeAreaView style={[styles.center, { paddingTop: topInset }]}>
-        <ActivityIndicator size="large" color="#0b1d3d" />
-      </SafeAreaView>
+    const result = Object.keys(groupsObj).map(key => ({ title: key, data: groupsObj[key] }));
+
+    if (completedMissions.length > 0) {
+      completedMissions.sort((a,b) => {
+         const dayA = Number(a.day) || 999; const dayB = Number(b.day) || 999; return dayA - dayB;
+      });
+      result.push({ title: '✅ 已完成', data: completedMissions });
+    }
+    return result;
+  }, [missions, myLoc]);
+
+  const checkIn = async (mission) => {
+    if (!myLoc) return Alert.alert("定位中...");
+    if (mission.isCompleted) return;
+    const dist = getDistance(myLoc.lat, myLoc.lng, mission.lat, mission.lng);
+    if (dist <= 100) {
+      try {
+        const missionRef = doc(db, 'missions', mission.id);
+        await updateDoc(missionRef, { isCompleted: true });
+        setMissions(prev => prev.map(m => m.id === mission.id ? { ...m, isCompleted: true } : m));
+        Alert.alert("🎉 打卡成功！", `恭喜完成 ${mission.name} 的探索！`);
+      } catch (e) { console.error(e); Alert.alert("錯誤", "打卡狀態更新失敗，請檢查網路"); }
+    } else { Alert.alert("還太遠囉", `距離 ${Math.round(dist)} 公尺`); }
+  };
+
+  // [Logic] 只有已完成的任務才觸發長按
+  const showDebugMenu = (mission) => {
+    Vibration.vibrate(100); 
+
+    Alert.alert(
+      "🕵️‍♂️ 測試者模式",
+      `要如何處理「${mission.name}」？`,
+      [
+        { text: "取消", style: "cancel" },
+        {
+          text: "🔄 重置為「未打卡」",
+          onPress: async () => {
+             try {
+                const missionRef = doc(db, 'missions', mission.id);
+                await updateDoc(missionRef, { isCompleted: false });
+                setMissions(prev => prev.map(m => m.id === mission.id ? { ...m, isCompleted: false } : m));
+                Alert.alert("🔄 重置成功", "已恢復為未完成狀態");
+             } catch(e) { Alert.alert("錯誤", e.message); }
+          }
+        },
+        {
+           text: "🗑️ 徹底刪除",
+           style: 'destructive',
+           onPress: async () => {
+              try {
+                 await deleteDoc(doc(db, 'missions', mission.id));
+                 setMissions(prev => prev.filter(m => m.id !== mission.id));
+              } catch(e) { Alert.alert("錯誤", e.message); }
+           }
+        }
+      ]
     );
-  }
+  };
 
-  const renderActionButtons = (m) => (
-    <View style={styles.row}>
-      <TouchableOpacity style={styles.btn} onPress={() => handleCheckIn(m)}>
-        <Text style={styles.btnText}>
-          {completedSet.has(String(m.id)) ? '已完成' : '打卡'}
-        </Text>
-      </TouchableOpacity>
+  const removeMission = (id) => {
+    Alert.alert("刪除", "確定移除?", [
+        { text: "取消" },
+        { text: "刪除", style: 'destructive', onPress: async () => {
+            await deleteDoc(doc(db, 'missions', id));
+            setMissions(prev => prev.filter(m => m.id !== id));
+        }}
+    ]);
+  };
 
-      <View style={{ width: 8 }} />
-
-      <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => goToMap(m)}>
-        <Text style={[styles.btnText, styles.btnOutlineText]}>查看地點</Text>
-      </TouchableOpacity>
-
-      <View style={{ width: 8 }} />
-
-      <TouchableOpacity style={[styles.btn, styles.btnDangerOutline]} onPress={() => handleDeleteMission(m)}>
-        <Text style={[styles.btnText, styles.btnDangerText]}>刪除</Text>
-      </TouchableOpacity>
+  const renderSectionHeader = ({ section: { title } }) => (
+    <View style={styles.sectionHeaderContainer}>
+      <View style={[ 
+          styles.dayBadge, 
+          title === '✅ 已完成' && { backgroundColor: COLORS.accent },
+          title === '額外任務' && { backgroundColor: COLORS.navBlue } // 額外任務用藍色
+      ]}>
+        <Text style={styles.dayBadgeText}>{title}</Text>
+      </View>
+      <View style={styles.sectionHeaderLine} />
     </View>
   );
 
   const renderItem = ({ item }) => {
-    if (item?._empty) {
-      return (
-        <View style={styles.emptySectionCard}>
-          <Text style={styles.emptySectionText}>{item._emptyText}</Text>
-        </View>
-      );
-    }
-
-    const bad = item._badCoord || !Number.isFinite(item.distance) || item.distance === Infinity;
-    const dayLabel = Number.isFinite(Number(item.day)) ? `・Day ${Number(item.day)}` : '';
+    const isDone = item.isCompleted;
 
     return (
-      <View style={styles.card}>
-        <Text style={styles.itemTitle}>
-          {item.badgeIcon} {item.name}
-        </Text>
-        <Text style={styles.gray}>
-          📍 {item.city || ''}{dayLabel}・距離 {bad ? '—' : `${Math.round(item.distance)} m`}
-        </Text>
-        {renderActionButtons(item)}
+      <View style={[ styles.card, isDone && { opacity: 0.6, backgroundColor: COLORS.completedBg } ]}>
+        <TouchableOpacity 
+          style={styles.cardLeft} 
+          onPress={() => goToMap(item)}
+          // [Logic] 只有已完成 (isDone) 的任務才觸發長按！
+          onLongPress={() => isDone && showDebugMenu(item)}
+          delayLongPress={3000} // 3 秒
+        >
+          <View style={[ styles.iconBox, isDone && { backgroundColor: '#d1fae5' } ]}>
+            <Text style={{fontSize: 20}}>{isDone ? '✅' : (item.badgeIcon || '📍')}</Text>
+          </View>
+          <View style={{flex: 1}}>
+            <View style={{flexDirection: 'row', alignItems: 'center'}}>
+               <Text style={[ styles.cardTitle, isDone && { textDecorationLine: 'line-through', color: COLORS.completedText } ]} numberOfLines={1}>
+                 {item.name}
+               </Text>
+               {!isDone && <Ionicons name="map" size={16} color={COLORS.navBlue} style={{marginLeft: 4}} />}
+            </View>
+            <Text style={styles.cardSub} numberOfLines={1}>{item.city || item.sourceTripName}</Text>
+            <Text style={[ styles.cardDist, item.dist < 500 && {color: COLORS.accent}, isDone && { color: COLORS.completedText } ]}>
+              {isDone ? '任務達成' : (item.dist ? `距離 ${item.dist < 1000 ? Math.round(item.dist) + 'm' : (item.dist/1000).toFixed(1) + 'km'}` : '計算中...')}
+            </Text>
+          </View>
+        </TouchableOpacity>
+  
+        <View style={styles.cardRight}>
+          <TouchableOpacity 
+            style={[ styles.checkInBtn, isDone && { backgroundColor: '#cbd5e1' } ]} 
+            onPress={() => checkIn(item)}
+            disabled={isDone}
+          >
+            <Text style={styles.checkInText}>{isDone ? '已打卡' : '打卡'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => removeMission(item.id)} style={{padding: 8}}>
+            <Ionicons name="trash-outline" size={20} color="#999" />
+          </TouchableOpacity>
+        </View>
       </View>
     );
   };
 
-  const renderSectionHeader = ({ section }) => (
-    <View style={styles.sectionHeaderWrap}>
-      <Text style={styles.sectionHeaderText}>{section.title}</Text>
-    </View>
-  );
-
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff', paddingTop: topInset }}>
-      <SectionList
-        sections={sections}
-        keyExtractor={(item) => String(item.id)}
-        renderItem={renderItem}
-        renderSectionHeader={renderSectionHeader}
-        ListHeaderComponent={header}
-        contentContainerStyle={{ paddingBottom: 24 }}
-        stickySectionHeadersEnabled={false}
-      />
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="dark-content" />
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>探索任務</Text>
+        <TouchableOpacity style={styles.importBtn} onPress={fetchHistoryTrips} disabled={importing}>
+          {importing ? <ActivityIndicator size="small" color={COLORS.primary} /> : (
+            <>
+              <Ionicons name="add-circle-outline" size={20} color={COLORS.primary} />
+              <Text style={styles.importText}>匯入行程</Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
 
-      {/* 匯入行程選單 */}
-      <Modal visible={pickerOpen} transparent animationType="fade" onRequestClose={() => setPickerOpen(false)}>
-        <Pressable style={styles.modalOverlay} onPress={() => setPickerOpen(false)}>
-          <Pressable style={styles.modalCard} onPress={() => {}}>
-            <Text style={styles.modalTitle}>選擇要匯入的行程</Text>
+      {importing && (
+        <View style={styles.progressContainer}>
+            <Text style={styles.progressText}>{importProgress}</Text>
+            <ActivityIndicator size="small" color="#666" style={{marginLeft: 8}} />
+        </View>
+      )}
 
-            <ScrollView style={{ maxHeight: 420 }} contentContainerStyle={{ paddingBottom: 12 }}>
-              <Text style={styles.modalSection}>🌟 AI 智慧行程</Text>
-              {aiTrips.length === 0 ? (
-                <Text style={styles.modalGray}>找不到可匯入的 AI 行程（需有 legacy.plan）。</Text>
-              ) : (
-                aiTrips.slice(0, 20).map((t) => (
-                  <TouchableOpacity key={`ai-${t.id}`} style={styles.pickRow} onPress={() => importFromAiTrip(t)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.pickTitle} numberOfLines={1}>{t.groupName || '未命名行程'}</Text>
-                      <Text style={styles.pickMeta}>🗓 {t.days || 1} 天　📍 {t.region || '—'}</Text>
-                    </View>
-                    <Text style={styles.pickGo}>匯入</Text>
-                  </TouchableOpacity>
-                ))
-              )}
+      {loading ? (
+        <View style={styles.center}><ActivityIndicator size="large" color={COLORS.primary} /></View>
+      ) : missions.length === 0 ? (
+        <View style={styles.emptyBox}>
+          <MaterialCommunityIcons name="map-marker-path" size={64} color="#ddd" />
+          <Text style={styles.emptyText}>目前沒有任務</Text>
+          <Text style={styles.emptySub}>點擊右上角「匯入行程」開始吧！</Text>
+        </View>
+      ) : (
+        <SectionList
+          sections={groupedMissions}
+          keyExtractor={item => item.id}
+          renderItem={renderItem}
+          renderSectionHeader={renderSectionHeader}
+          contentContainerStyle={{ paddingBottom: 100 }}
+          stickySectionHeadersEnabled={false} 
+        />
+      )}
 
-              <Text style={[styles.modalSection, { marginTop: 14 }]}>📝 自訂手動行程</Text>
-              {manualTrips.length === 0 ? (
-                <Text style={styles.modalGray}>找不到可匯入的自訂行程。</Text>
-              ) : (
-                manualTrips.slice(0, 20).map((p) => (
-                  <TouchableOpacity key={`m-${p.id}`} style={styles.pickRow} onPress={() => importFromManualTrip(p)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.pickTitle} numberOfLines={1}>{p.title || p.name || p.id}</Text>
-                      <Text style={styles.pickMeta}>🗓 {p.days || (Array.isArray(p.plans) ? p.plans.length : 1)} 天</Text>
-                    </View>
-                    <Text style={styles.pickGo}>匯入</Text>
-                  </TouchableOpacity>
-                ))
-              )}
+      <Modal visible={importModalVisible} transparent animationType="slide">
+        <Pressable style={styles.modalBg} onPress={() => setImportModalVisible(false)}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>選擇歷史行程</Text>
+                <Text style={{fontSize: 10, color: COLORS.debug, marginTop: 4}}>{debugMsg}</Text>
+              </View>
+              <TouchableOpacity onPress={() => setImportModalVisible(false)}>
+                <Ionicons name="close" size={24} color="#333" />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={{maxHeight: 400}}>
+              {historyTrips.map((trip, index) => (
+                <TouchableOpacity key={index} style={styles.tripItem} onPress={() => confirmAndImport(trip)}>
+                  <View style={[styles.tripIcon, { backgroundColor: trip.type === 'AI' ? '#e0f2fe' : '#fef3c7' }]}>
+                    <Text>{trip.type === 'AI' ? '🤖' : '📝'}</Text>
+                  </View>
+                  <View style={{flex: 1}}>
+                    <Text style={styles.tripTitle} numberOfLines={1}>{trip.title}</Text>
+                    <Text style={styles.tripInfo}>{trip.days} 天・{trip.region}</Text>
+                  </View>
+                  <Ionicons name="download-outline" size={20} color={COLORS.primary} />
+                </TouchableOpacity>
+              ))}
             </ScrollView>
-
-            <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setPickerOpen(false)}>
-              <Text style={styles.modalCloseText}>關閉</Text>
-            </TouchableOpacity>
-          </Pressable>
+          </View>
         </Pressable>
       </Modal>
     </SafeAreaView>
@@ -728,108 +501,67 @@ export default function MissionsScreen({ route }) {
 }
 
 const styles = StyleSheet.create({
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
-
-  title: { fontSize: 20, fontFamily: 'GenRyuMin' },
-  sub: { color: '#666', fontFamily: 'GenRyuMin', marginTop: 4 },
-
-  sectionRow: {
-    marginTop: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+  container: { flex: 1, backgroundColor: COLORS.bg },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  header: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    padding: 20, backgroundColor: COLORS.white,
+    borderBottomWidth: 1, borderBottomColor: COLORS.border,
+    paddingTop: Platform.OS === 'android' ? 40 : 20,
   },
-  sectionTitle: { fontSize: 16, fontFamily: 'GenRyuMin' },
-
-  importTopBtn: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#0b1d3d',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
+  headerTitle: { fontSize: 24, fontWeight: '800', color: COLORS.primary },
+  importBtn: {
+    flexDirection: 'row', alignItems: 'center', 
+    backgroundColor: '#e0f2fe', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20
   },
-  importTopBtnText: { color: '#0b1d3d', fontFamily: 'GenRyuMin' },
-
-  sectionHeaderWrap: {
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 6,
+  importText: { marginLeft: 4, color: COLORS.primary, fontWeight: 'bold' },
+  progressContainer: {
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+      padding: 8, backgroundColor: '#fffbe6'
   },
-  sectionHeaderText: {
-    fontFamily: 'GenRyuMin',
-    fontSize: 14,
-    color: '#111827',
+  progressText: { fontSize: 13, color: '#d97706', fontWeight: '600' },
+  sectionHeaderContainer: {
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingTop: 24, paddingBottom: 8, backgroundColor: COLORS.bg,
   },
-
-  gray: { color: '#666', fontFamily: 'GenRyuMin', marginTop: 8 },
-
-  row: { flexDirection: 'row', marginTop: 10 },
-
+  dayBadge: {
+    backgroundColor: '#0b1d3d', paddingVertical: 6, paddingHorizontal: 16,
+    borderTopLeftRadius: 10, borderTopRightRadius: 10, borderBottomRightRadius: 2, borderBottomLeftRadius: 2,
+  },
+  dayBadgeText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  sectionHeaderLine: { flex: 1, height: 1, backgroundColor: '#e2e8f0', marginLeft: 8, marginTop: 8 },
   card: {
-    marginHorizontal: 16,
-    marginBottom: 10,
-    padding: 14,
-    backgroundColor: '#f7f7f7',
-    borderRadius: 12,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    backgroundColor: COLORS.white, marginHorizontal: 16, marginTop: 8, padding: 16,
+    borderRadius: 16, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 5, elevation: 2
   },
-  itemTitle: { fontSize: 16, fontFamily: 'GenRyuMin', marginBottom: 6 },
-
-  btn: { alignSelf: 'flex-start', backgroundColor: '#0b1d3d', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
-  btnText: { color: '#fff', fontFamily: 'GenRyuMin' },
-
-  btnOutline: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#0b1d3d' },
-  btnOutlineText: { color: '#0b1d3d' },
-
-  btnDangerOutline: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#DC2626' },
-  btnDangerText: { color: '#DC2626' },
-
-  emptySectionCard: {
-    marginHorizontal: 16,
-    marginBottom: 10,
-    padding: 14,
-    borderRadius: 12,
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#eee',
+  cardLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
+  iconBox: {
+    width: 40, height: 40, borderRadius: 20, backgroundColor: '#f3f4f6',
+    alignItems: 'center', justifyContent: 'center', marginRight: 12
   },
-  emptySectionText: { fontFamily: 'GenRyuMin', color: '#6b7280' },
-
-  // Modal
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.25)',
-    justifyContent: 'center',
-    padding: 18,
+  cardTitle: { fontSize: 16, fontWeight: 'bold', color: COLORS.text },
+  cardSub: { fontSize: 12, color: COLORS.subText, marginTop: 2 },
+  cardDist: { fontSize: 12, color: COLORS.primary, marginTop: 2, fontWeight: '600' },
+  cardRight: { alignItems: 'flex-end', gap: 4 },
+  checkInBtn: {
+    backgroundColor: COLORS.primary, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8
   },
-  modalCard: {
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    padding: 14,
+  checkInText: { color: COLORS.white, fontSize: 12, fontWeight: 'bold' },
+  emptyBox: { flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 100 },
+  emptyText: { fontSize: 18, fontWeight: 'bold', color: '#999', marginTop: 16 },
+  emptySub: { fontSize: 14, color: '#bbb', marginTop: 8 },
+  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  modalContent: { backgroundColor: COLORS.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 20 },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
+  modalTitle: { fontSize: 18, fontWeight: 'bold', color: COLORS.primary },
+  tripItem: {
+    flexDirection: 'row', alignItems: 'center', paddingVertical: 14,
+    borderBottomWidth: 1, borderBottomColor: '#f3f4f6'
   },
-  modalTitle: { fontSize: 16, fontFamily: 'GenRyuMin', marginBottom: 10 },
-  modalSection: { fontSize: 14, fontFamily: 'GenRyuMin' },
-  modalGray: { fontSize: 12, fontFamily: 'GenRyuMin', color: '#666', marginTop: 6 },
-
-  pickRow: {
-    marginTop: 8,
-    padding: 10,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#eee',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
+  tripIcon: {
+    width: 36, height: 36, borderRadius: 18, backgroundColor: '#f0f9ff',
+    alignItems: 'center', justifyContent: 'center', marginRight: 12
   },
-  pickTitle: { fontSize: 13, fontFamily: 'GenRyuMin' },
-  pickMeta: { fontSize: 12, fontFamily: 'GenRyuMin', color: '#666', marginTop: 2 },
-  pickGo: { fontFamily: 'GenRyuMin', color: '#0b1d3d' },
-
-  modalCloseBtn: {
-    marginTop: 10,
-    alignSelf: 'flex-end',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  modalCloseText: { fontFamily: 'GenRyuMin', color: '#0b1d3d' },
+  tripTitle: { fontSize: 15, fontWeight: '600', color: COLORS.text },
+  tripInfo: { fontSize: 12, color: COLORS.subText, marginTop: 2 },
 });

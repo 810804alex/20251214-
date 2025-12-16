@@ -16,8 +16,10 @@ import * as Clipboard from 'expo-clipboard';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 
 import { db } from '../firebase';
-import { collection, onSnapshot, deleteDoc, doc, updateDoc } from 'firebase/firestore';
+// 🔥 修改 1：引入 query 和 where
+import { collection, onSnapshot, deleteDoc, doc, updateDoc, query, where } from 'firebase/firestore';
 
+// 引入你的共用元件
 import CustomAlert from '../components/ui/CustomAlert';
 import LoadingOverlay from '../components/ui/LoadingOverlay';
 
@@ -39,14 +41,26 @@ export default function GroupListScreen() {
   const [groups, setGroups] = useState([]);
   const [copiedId, setCopiedId] = useState(null);
   const [loading, setLoading] = useState(false);
+  
+  // Alert Config
   const [alertConfig, setAlertConfig] = useState({ visible: false, title: '', message: '', onConfirm: null });
 
-  useEffect(() => { AsyncStorage.getItem('username').then((u) => setMe(u || 'guest')); }, []);
+  useEffect(() => { 
+    AsyncStorage.getItem('username').then((u) => setMe(u || 'guest')); 
+  }, []);
 
+  // 🔥 修改 2：加上篩選條件，只監聽「我是成員」的群組
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, 'groups'), (snap) => {
+    if (!me) return; // 等到抓到使用者 ID 才開始監聽
+
+    // 建立查詢：只抓取 members 陣列包含 me 的文件
+    const q = query(collection(db, 'groups'), where('members', 'array-contains', me));
+
+    const unsub = onSnapshot(q, (snap) => {
       const rows = [];
       snap.forEach((d) => rows.push({ id: d.id, ...d.data() }));
+      
+      // 排序邏輯 (新 -> 舊)
       const toTs = (g) => {
         const ts = g?.createdAt;
         if (ts?.toMillis) return ts.toMillis();
@@ -58,27 +72,70 @@ export default function GroupListScreen() {
       setGroups(rows);
     });
     return () => unsub();
-  }, []);
+  }, [me]); // 🔥 這裡加入 [me] 作為依賴，當 me 改變時重新執行
 
   const showAlert = (title, message, onConfirm = null) => {
-    setAlertConfig({ visible: true, title, message, onConfirm: onConfirm || (() => setAlertConfig(prev => ({ ...prev, visible: false }))) });
-  };
-  const copyGroupId = async (gid) => {
-    try { await Clipboard.setStringAsync(gid); setCopiedId(gid); setTimeout(() => setCopiedId(null), 1500); } catch (e) { console.error(e); }
-  };
-  const handleDeleteGroup = (g) => {
-    showAlert('刪除群組', `確定要刪除「${g.name || '未命名'}」嗎？`, async () => {
-        setAlertConfig(prev => ({ ...prev, visible: false })); setLoading(true);
-        try { await deleteDoc(doc(db, 'groups', g.id)); if (g.manualPlanId) await deleteDoc(doc(db, 'manualPlans', g.manualPlanId)); } 
-        catch (e) { console.error(e); setTimeout(() => showAlert('刪除失敗', '請稍後再試'), 500); } finally { setLoading(false); }
+    setAlertConfig({ 
+      visible: true, 
+      title, 
+      message, 
+      onConfirm: onConfirm || (() => setAlertConfig(prev => ({ ...prev, visible: false }))) 
     });
   };
+
+  const copyGroupId = async (gid) => {
+    try { 
+      await Clipboard.setStringAsync(gid); 
+      setCopiedId(gid); 
+      setTimeout(() => setCopiedId(null), 1500); 
+    } catch (e) { 
+      console.error(e); 
+    }
+  };
+
+  // 整合組員邏輯：刪除群組時，同時刪除手動行程
+  const handleDeleteGroup = (g) => {
+    showAlert('刪除群組', `確定要刪除「${g.name || '未命名'}」嗎？`, async () => {
+        setAlertConfig(prev => ({ ...prev, visible: false })); 
+        setLoading(true);
+        try { 
+          // 1. 刪除群組文件
+          await deleteDoc(doc(db, 'groups', g.id)); 
+          
+          // 2. 如果有手動行程，一併刪除 (組員的功能)
+          if (g.manualPlanId) {
+            await deleteDoc(doc(db, 'manualPlans', g.manualPlanId)); 
+          }
+        } catch (e) { 
+          console.error(e); 
+          setTimeout(() => showAlert('刪除失敗', '請稍後再試'), 500); 
+        } finally { 
+          setLoading(false); 
+        }
+    });
+  };
+
+  // 整合組員邏輯：開啟手動行程 (若無 ID 則自動建立)
   const handleOpenManual = async (g) => {
     try {
-      const ref = doc(db, 'groups', g.id); let planId = g.manualPlanId;
-      if (!planId) { planId = `manual-${Math.random().toString(36).slice(2, 8)}`; await updateDoc(ref, { manualPlanId: planId }); }
-      navigation.navigate('ManualPlan', { planId, groupId: g.id, groupName: g.name || '未命名群組' });
-    } catch (e) { console.error(e); showAlert('錯誤', '無法開啟手動行程'); }
+      const ref = doc(db, 'groups', g.id); 
+      let planId = g.manualPlanId;
+      
+      // 如果還沒有 manualPlanId，幫他生成一個並存回去
+      if (!planId) { 
+        planId = `manual-${Math.random().toString(36).slice(2, 8)}`; 
+        await updateDoc(ref, { manualPlanId: planId }); 
+      }
+      
+      navigation.navigate('ManualPlan', { 
+        planId, 
+        groupId: g.id, 
+        groupName: g.name || '未命名群組' 
+      });
+    } catch (e) { 
+      console.error(e); 
+      showAlert('錯誤', '無法開啟手動行程'); 
+    }
   };
 
   const renderGroupCard = (g, index) => {
@@ -89,7 +146,7 @@ export default function GroupListScreen() {
     return (
       <View key={g.id} style={styles.ticketContainer}>
         
-        {/* ✨ 左側色條 (唯一有顏色的地方) */}
+        {/* 左側色條 */}
         <View style={[styles.colorStrip, { backgroundColor: accentColor }]} />
 
         {/* 缺口 */}
@@ -188,7 +245,7 @@ export default function GroupListScreen() {
           <Ionicons name="arrow-back" size={24} color="#0b1d3d" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>我的旅程</Text>
-         {/* 這裡原本的按鈕移除了，放一個空 View 來保持標題置中 */}
+         {/* 保持標題置中 */}
          <View style={{ width: 32 }} />
       </View>
 
@@ -197,7 +254,6 @@ export default function GroupListScreen() {
           <View style={styles.emptyContainer}>
             <MaterialCommunityIcons name="ticket-confirmation-outline" size={64} color="#cbd5e1" />
             <Text style={styles.emptyText}>世界這麼大，這裡卻這麼空？</Text>
-            {/* 這裡的按鈕也移除了 */}
           </View>
         ) : (
           groups.map((g, index) => renderGroupCard(g, index))
@@ -221,13 +277,11 @@ const styles = StyleSheet.create({
   
   scrollContent: { padding: 20, paddingBottom: 100 },
   
-  // Empty State (Modified)
+  // Empty State
   emptyContainer: { alignItems: 'center', marginTop: 120 },
   emptyText: { color: '#94a3b8', fontSize: 18, marginTop: 16, fontWeight: '600' },
 
-  // =========================
   // Ticket Card
-  // =========================
   ticketContainer: {
     backgroundColor: '#fff',
     borderRadius: 16,
@@ -257,7 +311,7 @@ const styles = StyleSheet.create({
   notchLeft: { left: -10 }, 
   notchRight: { right: -12 },
 
-  // --- Top Section ---
+  // Top Section
   ticketTopSection: {
     padding: 16, paddingBottom: 20, backgroundColor: '#fff',
   },
@@ -284,14 +338,14 @@ const styles = StyleSheet.create({
   metaValue: { fontSize: 15, color: '#334155', fontWeight: '700' },
   idValue: { fontSize: 14, color: '#334155', fontWeight: '600', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
 
-  // --- Tear Line ---
+  // Tear Line
   tearLineContainer: { height: 1, overflow: 'hidden', backgroundColor: '#fff', position: 'relative', zIndex: 5 },
   tearLineDashed: {
     height: 2, borderWidth: 1, borderColor: '#e2e8f0', borderStyle: 'dashed', marginTop: -1,
     marginHorizontal: 12 
   },
 
-  // --- Bottom Section ---
+  // Bottom Section
   ticketBottomSection: {
     padding: 12, backgroundColor: '#f8fafc',
   },
