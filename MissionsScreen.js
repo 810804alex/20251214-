@@ -29,7 +29,9 @@ import {
   deleteDoc, 
   writeBatch, 
   serverTimestamp,
-  updateDoc 
+  updateDoc,
+  query, // 🔥 務必引入 query
+  where  // 🔥 務必引入 where
 } from 'firebase/firestore';
 import { db } from '../firebase'; 
 
@@ -131,18 +133,27 @@ export default function MissionsScreen() {
     });
   }, []);
 
+  // 🔥 修改：嚴格抓取「我的」任務
   const fetchMissions = async () => {
+    if (!userId || userId === 'guest') return; // 防止未登入抓取
+    
+    setLoading(true);
     try {
-      const snap = await getDocs(collection(db, 'missions'));
+      // 使用 query + where 進行後端過濾，只抓 owner == userId
+      const q = query(collection(db, 'missions'), where('owner', '==', userId));
+      const snap = await getDocs(q);
+      
       const list = [];
       snap.forEach(doc => {
-        const d = doc.data();
-        if (d.owner === userId || !d.owner) {
-          list.push({ id: doc.id, ...d });
-        }
+        list.push({ id: doc.id, ...doc.data() });
       });
+      
       setMissions(list);
-    } catch (e) { console.error(e); } finally { setLoading(false); }
+    } catch (e) { 
+      console.error(e); 
+    } finally { 
+      setLoading(false); 
+    }
   };
 
   useFocusEffect(useCallback(() => { fetchMissions(); }, [userId]));
@@ -198,13 +209,12 @@ export default function MissionsScreen() {
     );
   };
 
-  // [Modified] 匯入邏輯：保留已完成和額外任務
   const handleImport = async (trip) => {
     let planData = trip.rawPlan;
     if (!planData && trip.type === 'Group') {
         const found = historyTrips.find(t => t.type === 'AI' && t.groupId === trip.id);
         if (found) planData = found.rawPlan;
-        else { Alert.alert('無法匯入', '此行程資料不完整。'); return; }
+        else { Alert.alert('無法匯入', '此群組尚未產生或儲存 AI 行程。'); return; }
     }
     setImportModalVisible(false);
     setImporting(true);
@@ -215,14 +225,11 @@ export default function MissionsScreen() {
 
       const batchDelete = writeBatch(db);
       
-      // [Change] 這裡不再無差別刪除，而是有條件刪除
       missions.forEach(m => {
           if(m.owner === userId) {
-              // 判斷是否為手動加入的額外任務 (通常手動加入的 icon 是 📍 或是沒有 day 屬性)
               const isManualExtra = m.badgeIcon === '📍' || !m.day;
               const isCompleted = m.isCompleted;
 
-              // 如果既不是已完成，也不是手動額外任務，才視為「舊行程的過期任務」進行刪除
               if (!isCompleted && !isManualExtra) {
                   batchDelete.delete(doc(db, 'missions', m.id));
               }
@@ -231,8 +238,6 @@ export default function MissionsScreen() {
       await batchDelete.commit();
 
       const batch = writeBatch(db);
-      // 我們不重新 fetch，直接用過濾後的本地 state 加上新的 mission
-      // 但為了確保資料一致，還是重新組裝比較保險，這裡先把新任務加進去
       
       let processedCount = 0;
       for (const p of places) {
@@ -257,7 +262,6 @@ export default function MissionsScreen() {
       }
       await batch.commit();
       
-      // 匯入完成後，重新讀取一次資料庫，這樣畫面就會包含「保留的舊任務」+「匯入的新任務」
       await fetchMissions();
       
       Alert.alert('匯入成功', `已切換至「${trip.title}」！\n(已完成與額外任務均保留)`);
@@ -272,15 +276,13 @@ export default function MissionsScreen() {
     });
   };
 
-  // 🔥 核心邏輯：依照 Day 分組與排序
+  // 🔥 分組邏輯：Day 1, Day 2 ... 額外任務 ... 已完成
   const groupedMissions = useMemo(() => {
     const processed = missions.map(m => ({ ...m, dist: myLoc ? getDistance(myLoc.lat, myLoc.lng, m.lat, m.lng) : null }));
     const activeMissions = processed.filter(m => !m.isCompleted);
     const completedMissions = processed.filter(m => m.isCompleted);
 
-    // [Modified] 排序邏輯：有 Day 的排前面，沒 Day (額外任務) 排後面
     activeMissions.sort((a, b) => {
-      // 如果是數字 Day，保持原值；如果是 undefined/null (額外任務)，給一個超大數字讓它排後面
       const dayA = typeof a.day === 'number' ? a.day : 9999;
       const dayB = typeof b.day === 'number' ? b.day : 9999;
       
@@ -293,7 +295,7 @@ export default function MissionsScreen() {
 
     const groupsObj = {};
     activeMissions.forEach(m => {
-      // [Modified] 如果沒有 day，歸類為 "額外任務"
+      // 只有當 day 是數字時才分天數，否則歸類為額外任務
       const d = (typeof m.day === 'number') ? `Day ${m.day}` : '額外任務';
       if (!groupsObj[d]) groupsObj[d] = [];
       groupsObj[d].push(m);
@@ -324,10 +326,8 @@ export default function MissionsScreen() {
     } else { Alert.alert("還太遠囉", `距離 ${Math.round(dist)} 公尺`); }
   };
 
-  // [Logic] 只有已完成的任務才觸發長按
   const showDebugMenu = (mission) => {
     Vibration.vibrate(100); 
-
     Alert.alert(
       "🕵️‍♂️ 測試者模式",
       `要如何處理「${mission.name}」？`,
@@ -373,7 +373,7 @@ export default function MissionsScreen() {
       <View style={[ 
           styles.dayBadge, 
           title === '✅ 已完成' && { backgroundColor: COLORS.accent },
-          title === '額外任務' && { backgroundColor: COLORS.navBlue } // 額外任務用藍色
+          title === '額外任務' && { backgroundColor: COLORS.navBlue }
       ]}>
         <Text style={styles.dayBadgeText}>{title}</Text>
       </View>
@@ -383,15 +383,13 @@ export default function MissionsScreen() {
 
   const renderItem = ({ item }) => {
     const isDone = item.isCompleted;
-
     return (
       <View style={[ styles.card, isDone && { opacity: 0.6, backgroundColor: COLORS.completedBg } ]}>
         <TouchableOpacity 
           style={styles.cardLeft} 
           onPress={() => goToMap(item)}
-          // [Logic] 只有已完成 (isDone) 的任務才觸發長按！
           onLongPress={() => isDone && showDebugMenu(item)}
-          delayLongPress={3000} // 3 秒
+          delayLongPress={3000}
         >
           <View style={[ styles.iconBox, isDone && { backgroundColor: '#d1fae5' } ]}>
             <Text style={{fontSize: 20}}>{isDone ? '✅' : (item.badgeIcon || '📍')}</Text>

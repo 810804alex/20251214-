@@ -11,9 +11,9 @@ import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/nativ
 import { Ionicons } from '@expo/vector-icons';
 
 import { db } from '../firebase';
-// [Modified] 引入 updateDoc, doc 以便更新任務狀態
-import { collection, getDocs, updateDoc, doc } from 'firebase/firestore'; 
-import { upsertMissionFromPlace } from '../services/MissionService';
+// 🔥 1. 新增 doc, setDoc, serverTimestamp 引用
+import { collection, getDocs, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+
 import { 
   awardBadgeForMission, 
   getCompletedMissionIdSet 
@@ -46,25 +46,37 @@ const CATEGORIES = [
 
 const { width, height } = Dimensions.get('window');
 
+// API: 搜尋地點建議
 async function fetchPredictions(text) {
   if (!text || text.length < 1) return [];
   try {
     const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(text)}&key=${GOOGLE_API_KEY}&language=zh-TW&components=country:tw`;
     const res = await fetch(url);
     const data = await res.json();
-    if (data.status === 'OK') return data.predictions;
+    if (data.status === 'OK') {
+      return data.predictions;
+    }
     return [];
-  } catch (e) { return []; }
+  } catch (e) {
+    console.error("Search Error:", e);
+    return [];
+  }
 }
 
+// API: 取得地點詳細資訊
 async function getPlaceDetails(placeId) {
   try {
     const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&key=${GOOGLE_API_KEY}&language=zh-TW&fields=geometry,name,formatted_address,photos,rating,types`;
     const res = await fetch(url);
     const data = await res.json();
-    if (data.status === 'OK') return data.result;
+    if (data.status === 'OK') {
+      return data.result;
+    }
     return null;
-  } catch (e) { return null; }
+  } catch (e) {
+    console.error("Details Error:", e);
+    return null;
+  }
 }
 
 export default function MapScreen() {
@@ -73,13 +85,16 @@ export default function MapScreen() {
   const mapRef = useRef(null);
 
   const [USER_ID, setUSER_ID] = useState('demo@user.com');
-  const [region, setRegion] = useState({ latitude: 23.6978, longitude: 120.9605, latitudeDelta: 0.05, longitudeDelta: 0.05 });
+  const [region, setRegion] = useState({
+    latitude: 23.6978, longitude: 120.9605, latitudeDelta: 0.05, longitudeDelta: 0.05,
+  });
   const [mapRegion, setMapRegion] = useState(null);
   const [userLocation, setUserLocation] = useState(null);
   
   const [selectedCategory, setSelectedCategory] = useState('tourist_attraction');
   const [markers, setMarkers] = useState([]);
   
+  // 搜尋相關
   const [searchText, setSearchText] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -95,106 +110,65 @@ export default function MapScreen() {
 
   useEffect(() => { AsyncStorage.getItem('username').then(u => u && setUSER_ID(u)); }, []);
 
-  // 1. 初始化定位
   useEffect(() => {
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') return;
-      
       const loc = await Location.getCurrentPositionAsync({});
-      const coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-      
-      setUserLocation(coords);
-
-      if (mapRef.current && !route.params?.focus) {
-          mapRef.current.animateToRegion({
-              ...coords,
-              latitudeDelta: 0.015,
-              longitudeDelta: 0.015,
-          }, 1000);
-      }
+      setUserLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
     })();
   }, []);
 
-  // 強制重新讀取 Firebase 任務狀態
   const fetchGlobalState = async () => {
     if (!USER_ID) return;
     try {
       const snap = await getDocs(collection(db, 'missions'));
       const ids = new Set();
       const idx = {};
-      const completedSet = new Set();
-
       snap.docs.forEach(d => {
         const data = d.data() || {};
-        if(data.owner === USER_ID || !data.owner) {
-            const key = data.placeId || data.id;
-            ids.add(key);
-            idx[key] = d.id;
-
-            if (data.isCompleted) {
-                completedSet.add(d.id);
-                if (data.placeId) completedSet.add(data.placeId);
-            }
-        }
+        // 這裡可以考慮也只抓取自己的，但為了比對 missionPlaceIds 暫時全部讀取
+        // 只要後端寫入正確，前端顯示就會正確
+        const key = data.placeId || data.id;
+        ids.add(key);
+        idx[key] = d.id;
       });
       setMissionPlaceIds(ids);
       setMissionIndex(idx);
+      const completedSet = await getCompletedMissionIdSet(USER_ID);
       setCompletedMissionIds(completedSet);
     } catch (e) { console.warn(e); }
   };
 
-  // 每次 Focus 都重抓資料
   useFocusEffect(
     useCallback(() => {
       fetchGlobalState();
 
       if (route.params?.focus && route.params?.openDetail) {
         const { focus } = route.params;
-        const targetLat = Number(focus.lat || focus.latitude);
-        const targetLng = Number(focus.lng || focus.longitude);
-
         const targetPOI = {
             id: focus.id || focus.placeId,
             name: focus.name,
-            latitude: targetLat,
-            longitude: targetLng,
+            latitude: Number(focus.lat || focus.latitude),
+            longitude: Number(focus.lng || focus.longitude),
             address: focus.address,
             rating: focus.rating,
             photoUrl: focus.photoUrl,
             isExternalFocus: true 
         };
         setSelectedPOI(targetPOI);
-
-        if (mapRef.current) {
-            mapRef.current.animateToRegion({
-                latitude: targetLat,
-                longitude: targetLng,
+        setTimeout(() => {
+            mapRef.current?.animateToRegion({
+                latitude: targetPOI.latitude,
+                longitude: targetPOI.longitude,
                 latitudeDelta: 0.005, 
                 longitudeDelta: 0.005,
             }, 800);
-        }
-        
+        }, 500); 
         navigation.setParams({ focus: null, openDetail: false });
       }
-    }, [USER_ID, route.params]) 
+    }, [USER_ID, route.params])
   );
-
-  useEffect(() => {
-      if (userLocation && selectedPOI && selectedPOI.isExternalFocus && mapRef.current) {
-          mapRef.current.fitToCoordinates(
-              [
-                  { latitude: userLocation.latitude, longitude: userLocation.longitude },
-                  { latitude: selectedPOI.latitude, longitude: selectedPOI.longitude }
-              ],
-              {
-                  edgePadding: { top: 250, right: 50, bottom: 280, left: 50 },
-                  animated: true,
-              }
-          );
-      }
-  }, [userLocation, selectedPOI]); 
-
 
   const fetchPOIs = useCallback(async (centerLat, centerLon, typeKey) => {
     if (selectedPOI && selectedPOI.isExternalFocus) return;
@@ -233,7 +207,7 @@ export default function MapScreen() {
     } else if (userLocation) {
         fetchPOIs(userLocation.latitude, userLocation.longitude, selectedCategory);
     }
-  }, [selectedCategory, mapRegion, userLocation]);
+  }, [selectedCategory, mapRegion]); 
 
   const handleSearchTextChange = async (text) => {
     setSearchText(text);
@@ -269,15 +243,24 @@ export default function MapScreen() {
           types: details.types,
           isExternalFocus: true,
         };
+
         setSelectedPOI(poi);
+        
         mapRef.current?.animateToRegion({
           latitude: poi.latitude,
           longitude: poi.longitude,
           latitudeDelta: 0.005,
           longitudeDelta: 0.005,
         }, 800);
-      } else { Alert.alert("錯誤", "無法取得地點詳細資訊"); }
-    } catch (e) { console.error(e); } finally { setLoading(false); }
+
+      } else {
+        Alert.alert("錯誤", "無法取得地點詳細資訊");
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleSearchThisArea = () => {
@@ -286,28 +269,54 @@ export default function MapScreen() {
 
   const recenterToUser = () => {
     if (!mapRef.current || !userLocation) return;
-    mapRef.current.animateToRegion({ ...userLocation, latitudeDelta: 0.02, longitudeDelta: 0.02 }, 600);
+    mapRef.current.animateToRegion({
+      ...userLocation, latitudeDelta: 0.02, longitudeDelta: 0.02
+    }, 600);
   };
+
+  // 🔥 2. 修正：明確建立帶有 Owner 的任務
+  const createMissionData = (p, docId) => ({
+      id: docId,
+      owner: USER_ID, // 👈 關鍵：必須寫入目前使用者 ID
+      name: p.name,
+      lat: p.latitude,
+      lng: p.longitude,
+      placeId: p.id,
+      city: p.address || '',
+      badgeIcon: '📍',
+      createdAt: serverTimestamp(),
+      isCompleted: false,
+      day: null // 👈 設定為 null，代表是額外任務
+  });
 
   const addMissionFor = async (p) => {
       setProcessing(true);
       try {
           const key = p.id; 
-          if (missionPlaceIds.has(key)) return Alert.alert('提示', '已在任務清單中');
+          if (missionPlaceIds.has(key)) {
+              Alert.alert('提示', '已在任務清單中');
+              return;
+          }
           
-          const mission = await upsertMissionFromPlace(p, '📍');
+          // 不再使用 MissionService，直接在此寫入以確保 Owner 正確
+          const docId = `m_${Math.random().toString(36).substr(2, 9)}`;
+          const ref = doc(db, 'missions', docId);
+          await setDoc(ref, createMissionData(p, docId));
+          
           setMissionPlaceIds(prev => new Set([...prev, key]));
-          setMissionIndex(prev => ({ ...prev, [key]: mission.id }));
+          setMissionIndex(prev => ({ ...prev, [key]: docId }));
           
           Alert.alert('✅ 成功', '已加入任務清單');
-      } catch (e) { Alert.alert('錯誤', '加入失敗'); }
+      } catch (e) { 
+          console.error(e);
+          Alert.alert('錯誤', '加入失敗'); 
+      }
       finally { setProcessing(false); }
   };
 
   const checkInHere = async (p) => {
       if (!userLocation) return Alert.alert('定位中...');
       const d = metersBetween(userLocation.latitude, userLocation.longitude, p.latitude, p.longitude);
-      
       if (d > DIST_THRESHOLD) return Alert.alert('太遠了', `還差 ${Math.round(d - DIST_THRESHOLD)} 公尺`);
       
       setProcessing(true);
@@ -315,25 +324,20 @@ export default function MapScreen() {
           const key = p.id;
           let mId = missionIndex[key];
           
-          // 如果還沒加入任務，先加入
+          // 如果任務不存在，先建立 (同樣要確保 Owner)
           if (!mId) {
-              const m = await upsertMissionFromPlace(p, '📍');
-              mId = m.id;
-              setMissionIndex(prev => ({ ...prev, [key]: mId }));
+              mId = `m_${Math.random().toString(36).substr(2, 9)}`;
+              const ref = doc(db, 'missions', mId);
+              await setDoc(ref, createMissionData(p, mId));
+
               setMissionPlaceIds(prev => new Set([...prev, key]));
+              setMissionIndex(prev => ({ ...prev, [key]: mId }));
           }
-          
+
           if (completedMissionIds.has(mId)) return Alert.alert('提示', '已經完成過了');
           
-          // 1. 給徽章
           await awardBadgeForMission(USER_ID, { id: mId, ...p });
-          
-          // [Fix] 2. 🔥 關鍵修正：同步更新 Missions 資料表，讓任務頁知道這已經完成
-          await updateDoc(doc(db, 'missions', mId), { isCompleted: true });
-
-          // 3. 更新本地 Map 狀態
           setCompletedMissionIds(prev => new Set([...prev, mId]));
-          
           Alert.alert('🎉 打卡成功！', `獲得徽章：${p.name}`);
       } catch (e) { 
           console.error(e);
@@ -341,11 +345,6 @@ export default function MapScreen() {
       }
       finally { setProcessing(false); }
   };
-
-  const isSelectedCompleted = selectedPOI && (
-      (missionIndex[selectedPOI.id] && completedMissionIds.has(missionIndex[selectedPOI.id])) ||
-      completedMissionIds.has(selectedPOI.id) 
-  );
 
   return (
     <View style={styles.container}>
@@ -361,7 +360,7 @@ export default function MapScreen() {
         showsCompass={false}
         showsMyLocationButton={false} 
         customMapStyle={MAP_STYLE} 
-        onPress={() => Keyboard.dismiss()} 
+        onPress={() => Keyboard.dismiss()}
       >
         {markers.map((m, idx) => {
             const isSelected = selectedPOI?.id === m.id;
@@ -409,11 +408,16 @@ export default function MapScreen() {
         )}
       </MapView>
 
+      {/* 頂部搜尋列 */}
       <SafeAreaView style={styles.topContainer} pointerEvents="box-none">
         <View style={styles.headerRow}>
-            <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+            <TouchableOpacity 
+                style={styles.backBtn} 
+                onPress={() => navigation.goBack()}
+            >
                 <Ionicons name="chevron-back" size={26} color={COLORS.text} />
             </TouchableOpacity>
+
             <View style={styles.searchBox}>
                 <Ionicons name="search" size={20} color={COLORS.subText} />
                 <TextInput
@@ -440,7 +444,10 @@ export default function MapScreen() {
               keyExtractor={(item) => item.place_id}
               keyboardShouldPersistTaps="handled"
               renderItem={({ item }) => (
-                <TouchableOpacity style={styles.suggestionItem} onPress={() => handleSuggestionPress(item)}>
+                <TouchableOpacity 
+                  style={styles.suggestionItem} 
+                  onPress={() => handleSuggestionPress(item)}
+                >
                   <View style={styles.suggestionIcon}>
                      <Ionicons name="location-sharp" size={18} color={COLORS.subText} />
                   </View>
@@ -463,8 +470,15 @@ export default function MapScreen() {
                           style={[styles.chip, selectedCategory === cat.key && styles.chipActive]}
                           onPress={() => setSelectedCategory(cat.key)}
                       >
-                          <Ionicons name={cat.icon} size={16} color={selectedCategory === cat.key ? '#fff' : COLORS.text} style={{ marginRight: 4 }} />
-                          <Text style={[styles.chipText, selectedCategory === cat.key && styles.chipTextActive]}>{cat.label}</Text>
+                          <Ionicons 
+                              name={cat.icon} 
+                              size={16} 
+                              color={selectedCategory === cat.key ? '#fff' : COLORS.text} 
+                              style={{ marginRight: 4 }}
+                          />
+                          <Text style={[styles.chipText, selectedCategory === cat.key && styles.chipTextActive]}>
+                              {cat.label}
+                          </Text>
                       </TouchableOpacity>
                   ))}
               </ScrollView>
@@ -513,22 +527,11 @@ export default function MapScreen() {
                         </TouchableOpacity>
 
                         <TouchableOpacity 
-                            style={[
-                                styles.actionBtn, 
-                                isSelectedCompleted ? styles.btnSuccess : styles.btnPrimary 
-                            ]}
+                            style={[styles.actionBtn, styles.btnPrimary]}
                             onPress={() => checkInHere(selectedPOI)}
-                            disabled={isSelectedCompleted} 
                         >
-                            <Ionicons 
-                                name={isSelectedCompleted ? "checkmark-circle" : "navigate-circle"} 
-                                size={20} 
-                                color="#FFF" 
-                                style={{marginRight: 4}} 
-                            />
-                            <Text style={styles.actionText}>
-                                {isSelectedCompleted ? '已完成' : '打卡'}
-                            </Text>
+                            <Ionicons name="navigate-circle" size={20} color="#FFF" style={{marginRight: 4}} />
+                            <Text style={styles.actionText}>打卡</Text>
                         </TouchableOpacity>
                     </View>
                 </View>
@@ -540,7 +543,11 @@ export default function MapScreen() {
         </View>
       )}
 
-      {loading && <View style={styles.loadingOverlay}><ActivityIndicator size="large" color={COLORS.primary} /></View>}
+      {loading && (
+          <View style={styles.loadingOverlay}>
+              <ActivityIndicator size="large" color={COLORS.primary} />
+          </View>
+      )}
     </View>
   );
 }
@@ -550,52 +557,116 @@ const styles = StyleSheet.create({
   map: { width, height },
 
   topContainer: { position: 'absolute', top: 0, width: '100%', zIndex: 10 },
-  headerRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10, gap: 12 },
-  backBtn: { width: 48, height: 48, borderRadius: 24, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 8, elevation: 4 },
-  searchBox: { flex: 1, flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 12, height: 48, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 8, elevation: 4 },
+  headerRow: {
+      flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10, gap: 12
+  },
+  backBtn: {
+      width: 48, height: 48, borderRadius: 24, backgroundColor: '#fff',
+      alignItems: 'center', justifyContent: 'center',
+      shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 8, elevation: 4,
+  },
+  searchBox: {
+      flex: 1,
+      flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff',
+      borderRadius: 12, paddingHorizontal: 12, height: 48,
+      shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 8, elevation: 4,
+  },
   searchInput: { flex: 1, marginLeft: 8, fontSize: 16, color: COLORS.text },
 
-  suggestionsContainer: { marginHorizontal: 16, marginTop: 8, backgroundColor: '#fff', borderRadius: 12, maxHeight: 250, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.15, shadowRadius: 8, elevation: 6, overflow: 'hidden' },
-  suggestionItem: { flexDirection: 'row', alignItems: 'center', padding: 12, borderBottomWidth: 1, borderBottomColor: '#f3f4f6' },
-  suggestionIcon: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#f3f4f6', alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  suggestionsContainer: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    maxHeight: 250,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.15, shadowRadius: 8, elevation: 6,
+    overflow: 'hidden'
+  },
+  suggestionItem: {
+    flexDirection: 'row', alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1, borderBottomColor: '#f3f4f6'
+  },
+  suggestionIcon: {
+    width: 32, height: 32, borderRadius: 16, backgroundColor: '#f3f4f6',
+    alignItems: 'center', justifyContent: 'center', marginRight: 12
+  },
   suggestionMainText: { fontSize: 15, fontWeight: '600', color: COLORS.text, marginBottom: 2 },
   suggestionSubText: { fontSize: 12, color: COLORS.subText },
   
   chipsContainer: { marginTop: 12, paddingBottom: 8, paddingLeft: 16 },
-  chip: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, marginRight: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.1, shadowRadius: 2, elevation: 2 },
+  chip: {
+      flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff',
+      paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, marginRight: 8,
+      shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.1, shadowRadius: 2, elevation: 2,
+  },
   chipActive: { backgroundColor: COLORS.primary },
   chipText: { fontSize: 14, color: COLORS.text, fontWeight: '600' },
   chipTextActive: { color: '#fff' },
 
-  markerPin: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#fff', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 4, elevation: 4 },
+  markerPin: {
+      width: 36, height: 36, borderRadius: 18, backgroundColor: '#fff',
+      alignItems: 'center', justifyContent: 'center',
+      borderWidth: 2, borderColor: '#fff',
+      shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 4, elevation: 4,
+  },
   markerPinSelected: { backgroundColor: COLORS.accent, transform: [{ scale: 1.2 }] },
   markerPinCompleted: { backgroundColor: COLORS.warning },
-  markerArrow: { width: 0, height: 0, backgroundColor: 'transparent', borderStyle: 'solid', borderLeftWidth: 6, borderRightWidth: 6, borderBottomWidth: 0, borderTopWidth: 8, borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#fff', alignSelf: 'center', marginTop: -2 },
+  markerArrow: {
+      width: 0, height: 0, backgroundColor: 'transparent', borderStyle: 'solid',
+      borderLeftWidth: 6, borderRightWidth: 6, borderBottomWidth: 0, borderTopWidth: 8,
+      borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#fff',
+      alignSelf: 'center', marginTop: -2,
+  },
 
-  fabLeft: { position: 'absolute', left: 16, bottom: 40, width: 48, height: 48, borderRadius: 24, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 6, elevation: 5, zIndex: 5 },
-  fabRight: { position: 'absolute', right: 16, bottom: 40, backgroundColor: COLORS.primary, paddingHorizontal: 16, paddingVertical: 12, borderRadius: 24, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 6, elevation: 5, zIndex: 5 },
+  fabLeft: {
+      position: 'absolute', left: 16, bottom: 40, 
+      width: 48, height: 48, borderRadius: 24, backgroundColor: '#fff',
+      alignItems: 'center', justifyContent: 'center',
+      shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 6, elevation: 5,
+      zIndex: 5
+  },
+  fabRight: {
+      position: 'absolute', right: 16, bottom: 40,
+      backgroundColor: COLORS.primary, paddingHorizontal: 16, paddingVertical: 12, borderRadius: 24,
+      shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 6, elevation: 5,
+      zIndex: 5
+  },
   fabRightText: { color: '#fff', fontWeight: 'bold' },
 
   cardContainer: { position: 'absolute', bottom: 30, width: '100%', paddingHorizontal: 16, zIndex: 10 },
-  card: { backgroundColor: '#fff', borderRadius: 20, overflow: 'hidden', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 12, elevation: 10 },
+  card: {
+      backgroundColor: '#fff', borderRadius: 20, overflow: 'hidden',
+      shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 12, elevation: 10,
+  },
   cardImage: { width: '100%', height: 140 },
   cardContent: { padding: 16 },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 },
   cardTitle: { fontSize: 18, fontWeight: '800', color: COLORS.text, marginBottom: 4 },
   cardAddress: { fontSize: 13, color: COLORS.subText },
-  ratingBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.warning, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
+  ratingBadge: { 
+      flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.warning, 
+      paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 
+  },
   ratingText: { color: '#fff', fontWeight: 'bold', marginLeft: 4, fontSize: 12 },
   
   cardActions: { flexDirection: 'row', gap: 12 },
-  actionBtn: { flex: 1, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center', flexDirection: 'row' },
+  actionBtn: { 
+      flex: 1, height: 44, borderRadius: 12, 
+      alignItems: 'center', justifyContent: 'center', flexDirection: 'row' 
+  },
   btnPrimary: { backgroundColor: COLORS.accent },
-  btnSuccess: { backgroundColor: COLORS.success },
   btnSecondary: { backgroundColor: '#F1F5F9' },
   actionText: { fontWeight: '700', color: '#fff', fontSize: 15 },
   textSecondary: { color: COLORS.text },
 
   closeCardBtn: { position: 'absolute', top: 10, right: 10, zIndex: 5 },
-  loadingOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(255,255,255,0.6)', alignItems: 'center', justifyContent: 'center', zIndex: 20 },
+
+  loadingOverlay: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: 'rgba(255,255,255,0.6)',
+      alignItems: 'center', justifyContent: 'center', zIndex: 20,
+  },
 });
 
 const MAP_STYLE = [
